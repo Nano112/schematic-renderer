@@ -5,6 +5,13 @@ import { TintManager } from "./TintManager";
 import { BlockModel, BlockStateDefinition } from "./types";
 import { AtlasBuilder } from "./AtlasBuilder";
 import { ResourcePackManager } from "./ResourcePackManager";
+import {
+	formatPackAssetReference,
+	normalizeResourceLocation,
+	packAssetFromFilePath,
+	parseResourceLocation,
+	resolveAssetFilePath,
+} from "./ResourceLocation";
 
 export class AssetLoader {
 	private resourcePacks: Map<string, JSZip> = new Map();
@@ -164,12 +171,13 @@ export class AssetLoader {
 			console.log("✅ ZIP loaded, entries:", Object.keys(zip.files).length);
 
 			// Filter and log structure
-			const assetFiles = Object.keys(zip.files).filter(
-				(path) => path.includes("assets/minecraft/") && !zip.files[path].dir
-			);
-			const blockstates = assetFiles.filter((p) => p.includes("blockstates/"));
-			const models = assetFiles.filter((p) => p.includes("models/"));
-			const textures = assetFiles.filter((p) => p.includes("textures/"));
+			const assetFiles = Object.keys(zip.files)
+				.filter((path) => !zip.files[path].dir)
+				.map((path) => packAssetFromFilePath(path))
+				.filter((asset): asset is NonNullable<typeof asset> => !!asset);
+			const blockstates = assetFiles.filter((asset) => asset.type === "blockstate");
+			const models = assetFiles.filter((asset) => asset.type === "model");
+			const textures = assetFiles.filter((asset) => asset.type === "texture");
 
 			console.log("📁 blockstates:", blockstates.length);
 			console.log("📁 models:", models.length);
@@ -208,15 +216,17 @@ export class AssetLoader {
 		path: string,
 		silent: boolean = true
 	): Promise<string | undefined> {
+		const resourcePath = resolveAssetFilePath(path);
+
 		// Check cache first
-		const cacheKey = `string:${path}`;
+		const cacheKey = `string:${resourcePath}`;
 		if (this.stringCache.has(cacheKey)) {
 			return this.stringCache.get(cacheKey);
 		}
 
 		// Try each resource pack in order of priority (highest first)
 		for (const { id: packId, zip } of this.getOrderedPacks()) {
-			const file = zip.file(`assets/minecraft/${path}`);
+			const file = zip.file(resourcePath);
 			if (file) {
 				try {
 					const content = await file.async("string");
@@ -231,7 +241,7 @@ export class AssetLoader {
 		}
 
 		if (!silent) {
-			console.warn(`Resource not found: ${path}`);
+			console.warn(`Resource not found: ${resourcePath}`);
 		}
 		return undefined;
 	}
@@ -240,14 +250,16 @@ export class AssetLoader {
 	 * Get a binary resource (textures, etc.)
 	 */
 	public async getResourceBlob(path: string): Promise<Blob | undefined> {
+		const resourcePath = resolveAssetFilePath(path);
+
 		// Try each resource pack in order of priority (highest first)
 		for (const { id: packId, zip } of this.getOrderedPacks()) {
-			const file = zip.file(`assets/minecraft/${path}`);
+			const file = zip.file(resourcePath);
 			if (file) {
 				try {
 					return await file.async("blob");
 				} catch (error) {
-					console.warn(`Error reading ${path} from pack ${packId}:`, error);
+					console.warn(`Error reading ${resourcePath} from pack ${packId}:`, error);
 				}
 			}
 		}
@@ -260,19 +272,18 @@ export class AssetLoader {
 	 * Get a block state definition
 	 */
 	public async getBlockState(blockId: string): Promise<BlockStateDefinition> {
-		// Remove minecraft: prefix if present
-		blockId = blockId.replace("minecraft:", "");
+		const normalizedBlockId = normalizeResourceLocation(blockId);
 
 		// Check cache first
-		const cacheKey = `blockstate:${blockId}`;
+		const cacheKey = `blockstate:${normalizedBlockId}`;
 		if (this.blockStateCache.has(cacheKey)) {
 			return this.blockStateCache.get(cacheKey)!;
 		}
 
 		// Load from resource pack
-		const jsonString = await this.getResourceString(`blockstates/${blockId}.json`);
+		const jsonString = await this.getResourceString(`blockstates/${normalizedBlockId}.json`);
 		if (!jsonString) {
-			console.warn(`Block state definition for ${blockId} not found.`);
+			console.warn(`Block state definition for ${normalizedBlockId} not found.`);
 			return {} as BlockStateDefinition;
 		}
 
@@ -281,28 +292,31 @@ export class AssetLoader {
 			this.blockStateCache.set(cacheKey, blockStateDefinition);
 			return blockStateDefinition;
 		} catch (error) {
-			console.error(`Error parsing blockstate for ${blockId}:`, error);
+			console.error(`Error parsing blockstate for ${normalizedBlockId}:`, error);
 			return {} as BlockStateDefinition;
 		}
 	}
 
 	public async getModel(modelPath: string): Promise<BlockModel> {
-		// Remove minecraft: prefix if present
-		modelPath = modelPath.replace("minecraft:", "");
+		const normalizedModelPath = normalizeResourceLocation(modelPath);
+		const modelLocation = parseResourceLocation(normalizedModelPath);
 
 		// Check cache first
-		const cacheKey = `model:${modelPath}`;
+		const cacheKey = `model:${normalizedModelPath}`;
 		if (this.modelCache.has(cacheKey)) {
 			return this.modelCache.get(cacheKey)!;
 		}
 
 		// Special handling for liquid models with level information
-		if (modelPath.startsWith("block/water") || modelPath.startsWith("block/lava")) {
-			const isWater = modelPath.startsWith("block/water");
+		if (
+			modelLocation.namespace === "minecraft" &&
+			(modelLocation.path.startsWith("block/water") || modelLocation.path.startsWith("block/lava"))
+		) {
+			const isWater = modelLocation.path.startsWith("block/water");
 
 			// Extract level from model path if present
 			let level = 0;
-			const levelMatch = modelPath.match(/_level_(\d+)/);
+			const levelMatch = modelLocation.path.match(/_level_(\d+)/);
 			if (levelMatch) {
 				level = parseInt(levelMatch[1], 10);
 			}
@@ -347,7 +361,7 @@ export class AssetLoader {
 			// Try to load the original model file if it exists and merge with our enhanced one
 			try {
 				// First try the exact path
-				let jsonString = await this.getResourceString(`models/${modelPath}.json`);
+				let jsonString = await this.getResourceString(`models/${normalizedModelPath}.json`);
 
 				// If not found and this is a level-specific model, try the base model
 				if (!jsonString && levelMatch) {
@@ -379,9 +393,9 @@ export class AssetLoader {
 		}
 
 		// For non-liquid models, load from resource pack
-		const jsonString = await this.getResourceString(`models/${modelPath}.json`);
+		const jsonString = await this.getResourceString(`models/${normalizedModelPath}.json`);
 		if (!jsonString) {
-			console.warn(`Model definition for ${modelPath} not found.`);
+			console.warn(`Model definition for ${normalizedModelPath} not found.`);
 			return {} as BlockModel;
 		}
 
@@ -399,7 +413,7 @@ export class AssetLoader {
 			this.modelCache.set(cacheKey, model);
 			return model;
 		} catch (error) {
-			console.error(`Error parsing model for ${modelPath}:`, error);
+			console.error(`Error parsing model for ${normalizedModelPath}:`, error);
 			return {} as BlockModel;
 		}
 	}
@@ -413,9 +427,6 @@ export class AssetLoader {
 		const MAX_DEPTH = 5; // Prevent infinite loops
 
 		while (parentPath && depth < MAX_DEPTH) {
-			// Fix: Remove "minecraft:" prefix if present in parent path
-			parentPath = parentPath.replace("minecraft:", "");
-
 			// Now try to load the model with the correct path
 			const parentModelString = await this.getResourceString(`models/${parentPath}.json`);
 			if (!parentModelString) {
@@ -463,8 +474,9 @@ export class AssetLoader {
 
 		// If not a reference, return as is (but handle namespace)
 		if (!textureRef.startsWith("#")) {
-			// Remove minecraft: prefix if present
-			return textureRef.replace("minecraft:", "");
+			return normalizeResourceLocation(textureRef, {
+				omitDefaultNamespace: true,
+			});
 		}
 
 		// Handle reference resolution with depth limit
@@ -488,8 +500,9 @@ export class AssetLoader {
 			return "block/missing_texture";
 		}
 
-		// Remove minecraft: prefix if present in the final resolved texture
-		return ref.replace("minecraft:", "");
+		return normalizeResourceLocation(ref, {
+			omitDefaultNamespace: true,
+		});
 	}
 
 	/** Advance animated textures; returns true if any frame flipped (needs redraw). */
@@ -498,50 +511,59 @@ export class AssetLoader {
 	}
 
 	public async getTexture(texturePath: string): Promise<THREE.Texture> {
+		const normalizedTexturePath = normalizeResourceLocation(texturePath, {
+			omitDefaultNamespace: true,
+		});
+
 		// Handle missing texture path
 		if (
-			!texturePath ||
-			texturePath === "missing_texture" ||
-			texturePath === "block/missing_texture"
+			!normalizedTexturePath ||
+			normalizedTexturePath === "missing_texture" ||
+			normalizedTexturePath === "block/missing_texture"
 		) {
 			console.warn("Missing texture path requested");
 			return this.createMissingTexture();
 		}
 
 		// Check cache first
-		const cacheKey = `texture:${texturePath}`;
+		const cacheKey = `texture:${normalizedTexturePath}`;
 		if (this.textureCache.has(cacheKey)) {
 			return this.textureCache.get(cacheKey)!;
 		}
 
 		// Check for animation
-		const isAnimated = await this.animatedTextureManager.isAnimated(`textures/${texturePath}`);
+		const isAnimated = await this.animatedTextureManager.isAnimated(
+			`textures/${normalizedTexturePath}`
+		);
 
 		if (isAnimated) {
-			const animatedTexture = await this.animatedTextureManager.createAnimatedTexture(texturePath);
+			const animatedTexture =
+				await this.animatedTextureManager.createAnimatedTexture(normalizedTexturePath);
 			if (animatedTexture) {
-				console.log(`Successfully created animated texture for ${texturePath}`);
+				console.log(`Successfully created animated texture for ${normalizedTexturePath}`);
 				this.textureCache.set(cacheKey, animatedTexture);
 				return animatedTexture;
 			} else {
 				console.warn(
-					`Failed to create animated texture for ${texturePath}, falling back to static`
+					`Failed to create animated texture for ${normalizedTexturePath}, falling back to static`
 				);
 			}
 		}
 
 		// If path doesn't end with .png, add it
-		const fullPath = texturePath.endsWith(".png") ? texturePath : `${texturePath}.png`;
+		const fullPath = normalizedTexturePath.endsWith(".png")
+			? normalizedTexturePath
+			: `${normalizedTexturePath}.png`;
 
 		// Load texture blob from resource pack
 		const blob = await this.getResourceBlob(`textures/${fullPath}`);
 		if (!blob) {
-			console.warn(`Texture blob not found for ${texturePath}`);
+			console.warn(`Texture blob not found for ${normalizedTexturePath}`);
 
 			// Special fallback for minecraft textures that might have different locations
-			if (texturePath.startsWith("block/")) {
+			if (normalizedTexturePath.startsWith("block/")) {
 				// Try without the "block/" prefix
-				const altPath = texturePath.replace("block/", "");
+				const altPath = normalizedTexturePath.replace("block/", "");
 				const altBlob = await this.getResourceBlob(`textures/${altPath}.png`);
 				if (altBlob) {
 					// Continue with this blob
@@ -549,11 +571,11 @@ export class AssetLoader {
 				}
 			}
 
-			console.error(`Texture ${texturePath} not found, using missing texture`);
+			console.error(`Texture ${normalizedTexturePath} not found, using missing texture`);
 			return this.createMissingTexture();
 		}
 
-		return this.createTextureFromBlob(blob, cacheKey, texturePath);
+		return this.createTextureFromBlob(blob, cacheKey, normalizedTexturePath);
 	}
 
 	// Helper for creating a texture from a blob
@@ -819,9 +841,12 @@ export class AssetLoader {
 		} = {}
 	): Promise<THREE.Material> {
 		const useAtlas = options.useAtlas ?? true;
+		const normalizedTexturePath = normalizeResourceLocation(texturePath, {
+			omitDefaultNamespace: true,
+		});
 
 		// Create cache key
-		const cacheKey = `material:${texturePath}:${useAtlas ? "atlas" : "individual"}:${JSON.stringify(
+		const cacheKey = `material:${normalizedTexturePath}:${useAtlas ? "atlas" : "individual"}:${JSON.stringify(
 			{
 				transparent: options.transparent,
 				isLiquid: options.isLiquid,
@@ -845,7 +870,7 @@ export class AssetLoader {
 		// its sides. Previously every non-`up` face was forced to *_flow, so the
 		// side faces showed the flow texture, which in many resource packs lacks an
 		// .mcmeta and therefore never animated while the still top did.
-		let finalTexturePath = texturePath;
+		let finalTexturePath = normalizedTexturePath;
 		if (options.isWater) {
 			finalTexturePath =
 				options.isFlowing && options.faceDirection !== "up"
@@ -893,10 +918,14 @@ export class AssetLoader {
 			if (!atlasUVData) {
 				// Try variations
 				const variations = [
-					finalTexturePath.replace("minecraft:", ""),
-					`block/${finalTexturePath.replace("minecraft:", "").replace("block/", "")}`,
-					texturePath.replace("minecraft:", ""),
-					`block/${texturePath.replace("minecraft:", "").replace("block/", "")}`,
+					normalizeResourceLocation(finalTexturePath, {
+						omitDefaultNamespace: true,
+					}),
+					`block/${finalTexturePath.replace("block/", "")}`,
+					normalizeResourceLocation(texturePath, {
+						omitDefaultNamespace: true,
+					}),
+					`block/${normalizedTexturePath.replace("block/", "")}`,
 					finalTexturePath.split("/").pop()
 						? `block/${finalTexturePath.split("/").pop()}`
 						: finalTexturePath,
@@ -1055,21 +1084,18 @@ export class AssetLoader {
 		let totalFound = 0;
 
 		for (const { zip } of this.getOrderedPacks()) {
-			const files = Object.keys(zip.files).filter(
-				(path) =>
-					path.includes("assets/minecraft/textures/") &&
-					path.endsWith(".png") &&
-					!zip.files[path].dir
-			);
+			const files = Object.keys(zip.files)
+				.filter((path) => !zip.files[path].dir)
+				.map((path) => packAssetFromFilePath(path))
+				.filter((asset): asset is NonNullable<typeof asset> => !!asset && asset.type === "texture");
 
 			for (const file of files) {
-				const relativePath = file.replace("assets/minecraft/textures/", "");
-				const texturePath = relativePath.replace(".png", "");
+				const texturePath = formatPackAssetReference(file);
 
 				totalFound++;
 
 				// Check if texture path starts with any allowed path
-				if (allowedPaths.some((allowed) => texturePath.startsWith(allowed))) {
+				if (allowedPaths.some((allowed) => file.path.startsWith(allowed))) {
 					allTextures.add(texturePath);
 				}
 			}
@@ -1208,16 +1234,19 @@ export class AssetLoader {
 		const blockstatesSet = new Set<string>();
 
 		for (const { zip } of this.getOrderedPacks()) {
-			const files = Object.keys(zip.files).filter(
-				(path) =>
-					path.includes("assets/minecraft/blockstates/") &&
-					path.endsWith(".json") &&
-					!zip.files[path].dir
-			);
+			const files = Object.keys(zip.files)
+				.filter((path) => !zip.files[path].dir)
+				.map((path) => packAssetFromFilePath(path))
+				.filter(
+					(asset): asset is NonNullable<typeof asset> => !!asset && asset.type === "blockstate"
+				);
 
 			for (const file of files) {
-				const blockId = file.replace("assets/minecraft/blockstates/", "").replace(".json", "");
-				blockstatesSet.add(`minecraft:${blockId}`);
+				blockstatesSet.add(
+					formatPackAssetReference(file, {
+						omitDefaultNamespace: false,
+					})
+				);
 			}
 		}
 
@@ -1231,7 +1260,11 @@ export class AssetLoader {
 	public getTextureUV(
 		path: string
 	): { u: number; v: number; width: number; height: number } | null {
-		return this.textureUVMap.get(path) || null;
+		const normalizedPath = normalizeResourceLocation(path, {
+			omitDefaultNamespace: true,
+		});
+
+		return this.textureUVMap.get(normalizedPath) || this.textureUVMap.get(path) || null;
 	}
 
 	public async getEntityTexture(entityName: string): Promise<THREE.Texture> {

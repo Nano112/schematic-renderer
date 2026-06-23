@@ -1,5 +1,6 @@
 import { AssetLoader } from "./AssetLoader";
 import { ModelData, Block, BlockStateDefinitionVariant } from "./types";
+import { formatResourceLocation } from "./ResourceLocation";
 
 export class ModelResolver {
 	private assetLoader: AssetLoader;
@@ -23,7 +24,10 @@ export class ModelResolver {
 		}
 
 		// Regular block state handling
-		const blockName = block.name.replace("minecraft:", "");
+		const blockName = formatResourceLocation({
+			namespace: block.namespace,
+			path: block.name,
+		});
 		const blockStateDefinition = await this.assetLoader.getBlockState(blockName);
 
 		// If no definition, return empty array
