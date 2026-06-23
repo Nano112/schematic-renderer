@@ -14,6 +14,7 @@ import {
 	PackEventHandler,
 	ResourcePackOptions,
 } from "../types/resourcePack";
+import { packPathForAsset } from "../cubane/ResourceLocation";
 
 export type DefaultPackCallback = () => Promise<Blob>;
 
@@ -850,19 +851,7 @@ export class ResourcePackManager {
 			if (!pack.enabled) continue;
 
 			const zip = await JSZip.loadAsync(pack.data);
-			let filePath: string;
-
-			switch (type) {
-				case "texture":
-					filePath = `assets/minecraft/textures/${path}.png`;
-					break;
-				case "blockstate":
-					filePath = `assets/minecraft/blockstates/${path}.json`;
-					break;
-				case "model":
-					filePath = `assets/minecraft/models/${path}.json`;
-					break;
-			}
+			const filePath = packPathForAsset(path, type);
 
 			if (zip.file(filePath)) {
 				return pack.id;
@@ -881,8 +870,7 @@ export class ResourcePackManager {
 
 		const zip = await JSZip.loadAsync(pack.data);
 		const file =
-			zip.file(`assets/minecraft/textures/${texturePath}.png`) ||
-			zip.file(`textures/${texturePath}.png`);
+			zip.file(packPathForAsset(texturePath, "texture")) || zip.file(`textures/${texturePath}.png`);
 
 		if (!file) return null;
 
