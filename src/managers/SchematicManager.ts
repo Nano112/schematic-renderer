@@ -5,12 +5,7 @@ import { WorldMeshBuilder } from "../WorldMeshBuilder"; // Adjust the import pat
 import { EventEmitter } from "events";
 import { SceneManager } from "./SceneManager"; // Adjust the import path
 import { SchematicRenderer } from "../SchematicRenderer";
-import {
-	MemoryLeakFix,
-	disposeGroup,
-	clearAllCaches,
-	forceGarbageCollection,
-} from "../utils/MemoryLeakFix";
+import { MemoryLeakFix, clearAllCaches, forceGarbageCollection } from "../utils/MemoryLeakFix";
 import { GeometryBufferPool } from "../GeometryBufferPool";
 import { performanceMonitor } from "../performance/PerformanceMonitor";
 interface LoadingProgress {
@@ -35,6 +30,9 @@ export class SchematicManager {
 	private options: SchematicManagerOptions;
 	private sceneManager: SceneManager;
 	private singleSchematicMode: boolean;
+	private disposed = false;
+	private activeFileReaders = new Set<FileReader>();
+	private activeFetches = new Set<AbortController>();
 
 	constructor(schematicRenderer: SchematicRenderer, options: SchematicManagerOptions = {}) {
 		this.schematicRenderer = schematicRenderer;
@@ -57,6 +55,8 @@ export class SchematicManager {
 	): Promise<ArrayBuffer> {
 		return new Promise((resolve, reject) => {
 			const reader = new FileReader();
+			this.activeFileReaders.add(reader);
+			const finish = () => this.activeFileReaders.delete(reader);
 
 			reader.onprogress = (event) => {
 				if (event.lengthComputable) {
@@ -65,8 +65,18 @@ export class SchematicManager {
 				}
 			};
 
-			reader.onload = () => resolve(reader.result as ArrayBuffer);
-			reader.onerror = () => reject(reader.error);
+			reader.onload = () => {
+				finish();
+				resolve(reader.result as ArrayBuffer);
+			};
+			reader.onerror = () => {
+				finish();
+				reject(reader.error);
+			};
+			reader.onabort = () => {
+				finish();
+				reject(new DOMException("Schematic load cancelled", "AbortError"));
+			};
 
 			reader.readAsArrayBuffer(file);
 		});
@@ -103,8 +113,11 @@ export class SchematicManager {
 			onProgress?: (progress: LoadingProgress) => void;
 		}
 	): Promise<void> {
+		if (this.disposed) return;
+
 		if (this.singleSchematicMode) {
 			await this.removeAllSchematics();
+			if (this.disposed) return;
 		}
 
 		// Parsing stage - 20% of total progress
@@ -146,6 +159,10 @@ export class SchematicManager {
 			schematicWrapper,
 			properties
 		);
+		if (this.disposed) {
+			schematicObject.dispose();
+			return;
+		}
 
 		options?.onProgress?.({
 			stage: "mesh_building",
@@ -221,11 +238,15 @@ export class SchematicManager {
 		}
 	): Promise<void> {
 		for (const key in schematicDataMap) {
+			if (this.disposed) return;
 			if (schematicDataMap.hasOwnProperty(key)) {
 				const arrayBuffer = await schematicDataMap[key]();
+				if (this.disposed) return;
 				const properties = propertiesMap ? propertiesMap[key] : undefined;
 				await this.loadSchematic(key, arrayBuffer, properties).then(() => {
-					this.sceneManager.schematicRenderer.options?.callbacks?.onSchematicLoaded?.(key);
+					if (!this.disposed) {
+						this.sceneManager.schematicRenderer.options?.callbacks?.onSchematicLoaded?.(key);
+					}
 				});
 			}
 		}
@@ -237,6 +258,7 @@ export class SchematicManager {
 			onProgress?: (progress: LoadingProgress) => void;
 		}
 	): Promise<void> {
+		if (this.disposed) return;
 		try {
 			// Start showing progress in UI if enabled
 			if (this.schematicRenderer.options.enableProgressBar && this.schematicRenderer.uiManager) {
@@ -245,6 +267,7 @@ export class SchematicManager {
 
 			// File reading stage
 			const arrayBuffer = await this.readFileWithProgress(file, (progress) => {
+				if (this.disposed) return;
 				// Update progress callback if provided
 				options?.onProgress?.({
 					stage: "file_reading",
@@ -260,6 +283,7 @@ export class SchematicManager {
 					);
 				}
 			});
+			if (this.disposed) return;
 
 			// Load the schematic with progress tracking
 			const id = file.name;
@@ -291,6 +315,7 @@ export class SchematicManager {
 			// Emit completion event
 			this.eventEmitter.emit("schematicLoaded", { id });
 		} catch (error) {
+			if (this.disposed) return;
 			// Hide progress bar on error
 			if (this.schematicRenderer.options.enableProgressBar && this.schematicRenderer.uiManager) {
 				this.schematicRenderer.uiManager.hideProgressBar();
@@ -317,6 +342,9 @@ export class SchematicManager {
 			onProgress?: (progress: LoadingProgress) => void;
 		}
 	): Promise<void> {
+		if (this.disposed) return;
+		const controller = new AbortController();
+		this.activeFetches.add(controller);
 		try {
 			// Generate a name for display
 			const displayName = name || new URL(url).pathname.split("/").pop() || "schematic";
@@ -335,7 +363,8 @@ export class SchematicManager {
 			});
 
 			// Fetch the schematic
-			const response = await fetch(url);
+			const response = await fetch(url, { signal: controller.signal });
+			if (this.disposed) return;
 			if (!response.ok) {
 				throw new Error(`HTTP error! status: ${response.status}`);
 			}
@@ -355,6 +384,7 @@ export class SchematicManager {
 			});
 
 			const arrayBuffer = await response.arrayBuffer();
+			if (this.disposed) return;
 
 			// Generate a name if none provided
 			const schematicName = name || new URL(url).pathname.split("/").pop() || "schematic_from_url";
@@ -386,6 +416,7 @@ export class SchematicManager {
 			// Emit completion event
 			this.eventEmitter.emit("schematicLoaded", { id: schematicName });
 		} catch (error) {
+			if (this.disposed) return;
 			// Hide progress bar on error
 			if (this.schematicRenderer.options.enableProgressBar && this.schematicRenderer.uiManager) {
 				this.schematicRenderer.uiManager.hideProgressBar();
@@ -393,6 +424,8 @@ export class SchematicManager {
 
 			this.eventEmitter.emit("schematicLoadError", { error });
 			throw error;
+		} finally {
+			this.activeFetches.delete(controller);
 		}
 	}
 
@@ -411,19 +444,15 @@ export class SchematicManager {
 
 			// Remove from map first to prevent any new operations on this schematic
 			this.schematics.delete(name);
+			// Mark disposed before awaiting its in-flight mesh build. Any late worker or
+			// sign result is discarded by SchematicObject instead of rejoining the scene.
+			schematicObject.dispose();
 
-			// Get meshes - if this fails, at least the schematic is removed from the map
+			// Wait for cancellation/cleanup to settle so this async API still means the
+			// schematic no longer owns pending work when it resolves.
 			const meshes = await schematicObject.getMeshes();
 			console.log("Before removal - scene children:", this.sceneManager.scene.children.length);
 			console.log("Meshes to remove:", meshes.length);
-
-			// Use the enhanced disposal method for comprehensive cleanup
-			disposeGroup(schematicObject.group);
-
-			// Additional cleanup for any remaining references
-			if (schematicObject.group.parent) {
-				schematicObject.group.parent.remove(schematicObject.group);
-			}
 
 			// On-demand rendering: the scene changed, redraw it.
 			this.schematicRenderer.invalidate();
@@ -462,6 +491,10 @@ export class SchematicManager {
 	}
 
 	addSchematic(schematic: SchematicObject): void {
+		if (this.disposed) {
+			schematic.dispose();
+			return;
+		}
 		this.schematics.set(schematic.id, schematic);
 
 		// Auto-load definition regions from schematic metadata if enabled
@@ -470,6 +503,7 @@ export class SchematicManager {
 			// Defer loading to ensure schematic is fully initialized
 			// Use queueMicrotask for better performance than setTimeout
 			queueMicrotask(() => {
+				if (this.disposed || !this.schematics.has(schematic.id)) return;
 				try {
 					const regionNames = schematic.loadDefinitionRegions();
 					if (regionNames.length > 0) {
@@ -630,6 +664,9 @@ export class SchematicManager {
 			position: THREE.Vector3 | number[];
 		}>
 	): SchematicObject {
+		if (this.disposed) {
+			throw new Error("Cannot create a schematic after SchematicManager disposal");
+		}
 		const schematicWrapper = new SchematicWrapper();
 		const schematicObject = new SchematicObject(
 			this.schematicRenderer,
@@ -645,5 +682,21 @@ export class SchematicManager {
 		this.eventEmitter.emit("schematicLoaded", { id: name });
 
 		return schematicObject;
+	}
+
+	/** Cancel pending loads and release every schematic owned by this manager. */
+	public dispose(): void {
+		if (this.disposed) return;
+		this.disposed = true;
+
+		this.activeFileReaders.forEach((reader) => {
+			if (reader.readyState === FileReader.LOADING) reader.abort();
+		});
+		this.activeFileReaders.clear();
+		this.activeFetches.forEach((controller) => controller.abort());
+		this.activeFetches.clear();
+
+		this.schematics.forEach((schematic) => schematic.dispose());
+		this.schematics.clear();
 	}
 }

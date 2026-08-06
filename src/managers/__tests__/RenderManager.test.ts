@@ -1,5 +1,7 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import * as THREE from "three";
+import { EventEmitter } from "events";
+import { RenderManager } from "../RenderManager";
 
 // Mock all problematic imports
 vi.mock("nucleation", () => ({
@@ -87,6 +89,99 @@ vi.stubGlobal("indexedDB", mockIndexedDB);
 // Since RenderManager creates a real WebGLRenderer which fails in test environment,
 // we test the class at a higher level with mocked dependencies
 describe("RenderManager", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	function createManager() {
+		const parent = document.createElement("div");
+		const canvas = document.createElement("canvas");
+		parent.appendChild(canvas);
+		Object.defineProperties(parent, {
+			clientWidth: { value: 640 },
+			clientHeight: { value: 360 },
+		});
+		const cameraManager = new EventEmitter() as EventEmitter & {
+			activeCamera: { camera: THREE.PerspectiveCamera };
+			updateAspectRatio: ReturnType<typeof vi.fn>;
+		};
+		cameraManager.activeCamera = { camera: new THREE.PerspectiveCamera() };
+		cameraManager.updateAspectRatio = vi.fn();
+		const schematicRenderer = {
+			canvas,
+			options: {},
+			eventEmitter: new EventEmitter(),
+			cameraManager,
+			sceneManager: { scene: new THREE.Scene() },
+			invalidate: vi.fn(),
+		} as any;
+		const manager = new RenderManager(schematicRenderer);
+		const renderer = {
+			domElement: canvas,
+			dispose: vi.fn(),
+			setSize: vi.fn(),
+			getPixelRatio: vi.fn().mockReturnValue(1),
+		} as any;
+		(manager as any).renderer = renderer;
+		return { manager, renderer, cameraManager, parent };
+	}
+
+	it("removes resize observers/listeners and disposes owned renderer once", () => {
+		const disconnect = vi.fn();
+		const observe = vi.fn();
+		vi.stubGlobal(
+			"ResizeObserver",
+			class {
+				observe = observe;
+				disconnect = disconnect;
+			}
+		);
+		const removeListener = vi.spyOn(window, "removeEventListener");
+		const { manager, renderer, cameraManager, parent } = createManager();
+		const cameraHandler = vi.fn();
+		(manager as any).cameraChangedHandler = cameraHandler;
+		cameraManager.on("cameraChanged", cameraHandler);
+
+		(manager as any).setupEventListeners();
+		manager.dispose();
+		manager.dispose();
+
+		expect(observe).toHaveBeenCalledWith(parent);
+		expect(disconnect).toHaveBeenCalledOnce();
+		expect(removeListener).toHaveBeenCalledWith("resize", expect.any(Function));
+		expect(cameraManager.listenerCount("cameraChanged")).toBe(0);
+		expect(renderer.dispose).toHaveBeenCalledOnce();
+	});
+
+	it("cleans resources created after disposal during async initialization", async () => {
+		const { manager, renderer } = createManager();
+		let finishInitialization!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			finishInitialization = resolve;
+		});
+		(manager as any).renderer = undefined;
+		(manager as any).initWebGLRenderer = vi.fn(async () => {
+			await gate;
+			(manager as any).renderer = renderer;
+		});
+
+		const initialization = manager.initialize();
+		manager.dispose();
+		finishInitialization();
+		await initialization;
+
+		expect(renderer.dispose).toHaveBeenCalledOnce();
+	});
+
+	it("does not dispose a renderer owned by a shared context", () => {
+		const { manager, renderer } = createManager();
+		(manager as any).usesSharedRenderer = true;
+
+		manager.dispose();
+
+		expect(renderer.dispose).not.toHaveBeenCalled();
+	});
+
 	describe("SSAO presets", () => {
 		it("should have default SSAO preset values", () => {
 			// Test static configuration without instantiating

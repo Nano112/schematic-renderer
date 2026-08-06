@@ -4,12 +4,13 @@ import { ResourcePackManager, DefaultPackCallback } from "./managers/ResourcePac
 import MeshBuilderWorker from "./workers/MeshBuilder.worker?worker&inline";
 import MeshBuilderWasmWorker from "./workers/MeshBuilderWasm.worker?worker&inline";
 import { getClampedPixelRatio } from "./utils/pixelRatio";
+import type { ResourcePackOptions } from "./types/resourcePack";
 
 export interface SchematicRendererContextOptions {
 	/** Render unknown blocks as a purple placeholder (defaults to false). */
 	showUnknownBlocks?: boolean;
 	/** Passed through to the internal ResourcePackManager. */
-	resourcePackOptions?: any;
+	resourcePackOptions?: ResourcePackOptions;
 	/**
 	 * Render every attached view through ONE shared WebGL context (render-and-blit)
 	 * instead of one context per renderer. Bypasses the browser's ~8–16 context
@@ -115,7 +116,12 @@ export class SchematicRendererContext {
 		defaultResourcePacks: Record<string, DefaultPackCallback> = {},
 		options: SchematicRendererContextOptions = {}
 	): Promise<SchematicRendererContext> {
-		const cubane = new Cubane({ showUnknownBlocks: options.showUnknownBlocks });
+		const cubane = new Cubane({
+			autoRestore:
+				options.resourcePackOptions?.restoreCachedPacks ??
+				Object.keys(defaultResourcePacks).length === 0,
+			showUnknownBlocks: options.showUnknownBlocks,
+		});
 		const resourcePackManager = new ResourcePackManager(options.resourcePackOptions);
 		await resourcePackManager.initPromise;
 

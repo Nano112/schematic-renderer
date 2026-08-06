@@ -208,6 +208,11 @@ export type PackEventHandler<T extends PackEventType> = (event: PackEventMap[T])
  * Options for resource pack management UI and behavior
  */
 export interface ResourcePackOptions {
+	/**
+	 * Restore packs saved by Cubane when no explicit default pack is supplied.
+	 * Defaults to true without defaults and false when defaults are provided.
+	 */
+	restoreCachedPacks?: boolean;
 	/** Enable the resource pack management UI (default: true) */
 	enableUI?: boolean;
 	/** Position of the UI panel */

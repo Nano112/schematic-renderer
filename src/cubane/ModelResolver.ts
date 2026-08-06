@@ -1,5 +1,5 @@
 import { AssetLoader } from "./AssetLoader";
-import { ModelData, Block, BlockStateDefinitionVariant } from "./types";
+import { ModelData, Block, BlockStateCondition } from "./types";
 
 export class ModelResolver {
 	private assetLoader: AssetLoader;
@@ -163,21 +163,7 @@ export class ModelResolver {
 				let applies = true;
 
 				// Check conditions
-				if (part.when) {
-					if ("OR" in part.when) {
-						// OR condition - any of the conditions can match
-						applies = false;
-						for (const condition of part.when.OR as BlockStateDefinitionVariant<string>[]) {
-							if (this.matchesCondition(block, condition as Record<string, string>)) {
-								applies = true;
-								break;
-							}
-						}
-					} else {
-						// AND condition - all conditions must match
-						applies = this.matchesCondition(block, part.when);
-					}
-				}
+				if (part.when) applies = this.matchesCondition(block, part.when);
 
 				// If conditions are met, add the model(s)
 				if (applies) {
@@ -232,7 +218,14 @@ export class ModelResolver {
 		};
 	}
 
-	private matchesCondition(block: Block, condition: Record<string, string | number>): boolean {
+	private matchesCondition(block: Block, condition: BlockStateCondition): boolean {
+		if ("AND" in condition && Array.isArray(condition.AND)) {
+			return condition.AND.every((nested) => this.matchesCondition(block, nested));
+		}
+		if ("OR" in condition && Array.isArray(condition.OR)) {
+			return condition.OR.some((nested) => this.matchesCondition(block, nested));
+		}
+
 		for (const [property, value] of Object.entries(condition)) {
 			const blockValue = block.properties[property];
 

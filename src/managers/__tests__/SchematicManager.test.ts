@@ -35,6 +35,7 @@ vi.mock("../SchematicObject", () => ({
 		}
 
 		getMeshes = vi.fn().mockResolvedValue([]);
+		dispose = vi.fn();
 		containsPosition = vi.fn().mockReturnValue(false);
 		getBoundingBox = vi.fn().mockReturnValue([
 			[0, 0, 0],
@@ -225,6 +226,21 @@ describe("SchematicManager", () => {
 			expect(mockEventEmitter.emit).toHaveBeenCalledWith("schematicRemoved", {
 				id: "test",
 			});
+		});
+
+		it("should dispose the schematic before waiting for its meshes", async () => {
+			await manager.loadSchematic("test", new ArrayBuffer(100));
+			const schematic = manager.getSchematic("test")!;
+			const dispose = vi.mocked(schematic.dispose);
+			const getMeshes = vi.mocked(schematic.getMeshes);
+
+			await manager.removeSchematic("test");
+
+			expect(dispose).toHaveBeenCalledOnce();
+			expect(getMeshes).toHaveBeenCalledOnce();
+			expect(dispose.mock.invocationCallOrder[0]).toBeLessThan(
+				getMeshes.mock.invocationCallOrder[0]
+			);
 		});
 
 		it("should show empty state when last schematic is removed", async () => {

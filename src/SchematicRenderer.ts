@@ -47,6 +47,10 @@ import { KeyboardControls } from "./managers/KeyboardControls";
 import { InspectorManager } from "./managers/InspectorManager";
 import { RegionManager } from "./managers/RegionManager";
 import { RegionInteractionHandler } from "./managers/highlight/RegionInteractionHandler";
+import {
+	BlockEntityRendererRegistry,
+	createDefaultBlockEntityRenderers,
+} from "./block-entities/index";
 
 export class SchematicRenderer {
 	public canvas: HTMLCanvasElement;
@@ -82,6 +86,8 @@ export class SchematicRenderer {
 	public slicerOverlay: SlicerOverlay | undefined;
 	public resourcePackNotice: ResourcePackNotice | undefined;
 	public cubane: Cubane;
+	/** Registry used for NBT-aware block entities rendered with each schematic. */
+	public readonly blockEntityRenderers: BlockEntityRendererRegistry;
 	public state: {
 		cameraPosition: THREE.Vector3;
 	};
@@ -96,6 +102,15 @@ export class SchematicRenderer {
 		this.canvas = canvas;
 
 		this.options = merge({}, DEFAULT_OPTIONS, options);
+		const blockEntityOptions = this.options.blockEntityOptions;
+		this.blockEntityRenderers = new BlockEntityRendererRegistry([
+			...(blockEntityOptions?.includeDefaultRenderers === false
+				? []
+				: createDefaultBlockEntityRenderers({
+						playerHeads: blockEntityOptions?.playerHeads,
+					})),
+			...(blockEntityOptions?.renderers ?? []),
+		]);
 
 		// targetFPS is an upper cap on rendered frames; on-demand rendering decides
 		// *whether* to render. enableAdaptiveFPS/idleThreshold are legacy no-ops
@@ -174,6 +189,9 @@ export class SchematicRenderer {
 			this.options.context.attachRenderer(this);
 		} else {
 			this.cubane = new Cubane({
+				autoRestore:
+					this.options.resourcePackOptions?.restoreCachedPacks ??
+					Object.keys(defaultResourcePacks).length === 0,
 				showUnknownBlocks: this.options.debugOptions?.showUnknownBlocks,
 			});
 		}
@@ -295,6 +313,12 @@ export class SchematicRenderer {
 				? Promise.resolve()
 				: this.initializeResourcePacks(defaultResourcePacks);
 			await Promise.all([wasmReady, packsReady]);
+			if (this.isDisposed) {
+				// A private pack load can finish after dispose(). Dispose once more to
+				// release any atlas/textures published by that late continuation.
+				if (!this.options.context) this.cubane.dispose();
+				return;
+			}
 			this.updateMissingPackNotice();
 
 			// Step 4: Initialize builders and managers
@@ -318,6 +342,7 @@ export class SchematicRenderer {
 			// Initialize RenderManager (async for WebGPU support)
 			this.renderManager = new RenderManager(this);
 			await this.renderManager.initialize();
+			if (this.isDisposed) return;
 
 			this.highlightManager = new HighlightManager(this);
 			this.insignManager = new InsignManager(this);
@@ -335,6 +360,7 @@ export class SchematicRenderer {
 			if (Object.keys(schematicData).length > 0) {
 				showProgress("Loading initial schematics...", 0.75);
 				await this.schematicManager.loadSchematics(schematicData);
+				if (this.isDisposed) return;
 			}
 
 			// Step 6: Setup camera and interaction
@@ -368,6 +394,7 @@ export class SchematicRenderer {
 				this.uiManager.hideProgressBar();
 			}
 		} catch (error) {
+			if (this.isDisposed) return;
 			console.error("Failed to initialize SchematicRenderer:", error);
 
 			// Show error in progress bar
@@ -1290,6 +1317,7 @@ export class SchematicRenderer {
 		// Clear Cubane's existing resources
 		this.cubane.dispose();
 		this.cubane = new Cubane({
+			autoRestore: false,
 			showUnknownBlocks: this.options.debugOptions?.showUnknownBlocks,
 		}); // Recreate fresh instance
 
@@ -1746,7 +1774,9 @@ export class SchematicRenderer {
 	}
 
 	public dispose(): void {
-		// Mark as disposed to stop animation loop
+		if (this.isDisposed) return;
+
+		// Mark first: every async continuation checks this flag before publishing work.
 		this.isDisposed = true;
 
 		// Cancel any pending frame/idle-poll to stop the loop immediately
@@ -1755,50 +1785,54 @@ export class SchematicRenderer {
 		// Unbind pointer events
 		this.unbindPointerEvents();
 
-		// Dispose keyboard controls
-		if (this.keyboardControls) {
-			this.keyboardControls.dispose();
-			this.keyboardControls = undefined;
-		}
+		this.schematicManager?.dispose();
+		this.schematicManager = undefined;
 
-		// Dispose inspector
-		if (this.inspectorManager) {
-			this.inspectorManager.dispose();
-			this.inspectorManager = undefined;
-		}
+		// Reject pending mesh jobs and terminate only workers owned by this renderer.
+		// WorldMeshBuilder itself preserves shared-context workers.
+		this.worldMeshBuilder?.dispose();
+		this.worldMeshBuilder = undefined;
 
-		if (this.regionManager) {
-			this.regionManager.dispose();
-			this.regionManager = undefined;
-		}
-
-		if (this.regionInteractionHandler) {
-			this.regionInteractionHandler.dispose();
-			this.regionInteractionHandler = undefined;
-		}
-
-		if (!this.renderManager) {
-			return;
-		}
-		if (!this.highlightManager) {
-			return;
-		}
-		if (!this.uiManager) {
-			return;
-		}
-
-		this.highlightManager.dispose();
-		this.renderManager.renderer.dispose();
+		this.keyboardControls?.dispose();
+		this.keyboardControls = undefined;
+		this.inspectorManager?.dispose();
+		this.inspectorManager = undefined;
+		this.regionManager?.dispose();
+		this.regionManager = undefined;
+		this.regionInteractionHandler?.dispose();
+		this.regionInteractionHandler = undefined;
+		this.highlightManager?.dispose();
+		this.highlightManager = undefined;
+		this.renderManager?.dispose();
+		this.renderManager = undefined;
+		this.interactionManager?.dispose();
+		this.interactionManager = undefined;
 		this.dragAndDropManager?.dispose();
+		this.dragAndDropManager = undefined;
+		this.gizmoManager?.dispose();
+		this.gizmoManager = undefined;
+		this.simulationManager?.destroy();
+		this.simulationManager = undefined;
+		this.blockInteractionHandler?.dispose();
+		this.blockInteractionHandler = undefined;
+		this.insignIoManager?.dispose();
+		this.insignIoManager = undefined;
+		this.overlayManager?.dispose();
+		this.overlayManager = undefined;
 		this.resourcePackNotice?.dispose();
-		this.uiManager.dispose();
-		this.cameraManager.dispose();
-
-		// Clean up sidebar UI
+		this.resourcePackNotice = undefined;
+		this.slicerOverlay?.dispose();
+		this.slicerOverlay = undefined;
+		this.uiManager?.dispose();
+		this.uiManager = undefined;
+		this.cameraManager?.dispose();
 		this.sidebar?.dispose();
+		this.sidebar = undefined;
+		this.resourcePackManager?.dispose();
 
-		// Clean up resource pack manager
-		this.resourcePackManager.dispose();
+		if ((this.canvas as any).schematicRenderer === this) {
+			delete (this.canvas as any).schematicRenderer;
+		}
 
 		// Clean up Cubane resources. When using a shared context, the Cubane is owned
 		// by the context (and shared with other renderers) — just detach, don't dispose.

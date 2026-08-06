@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import * as THREE from "three";
+import { WorldMeshBuilder } from "./WorldMeshBuilder";
 
 // Mock problematic imports BEFORE they are used/imported by other modules
 vi.mock("./wasm/minecraft_schematic_utils_bg.wasm", () => ({
@@ -10,6 +11,13 @@ vi.mock("nucleation", () => ({
 	SchematicWrapper: class {},
 }));
 vi.mock("./workers/MeshBuilder.worker?worker&inline", () => ({
+	default: class MockWorker {
+		postMessage() {}
+		terminate() {}
+		onmessage = null;
+	},
+}));
+vi.mock("./workers/MeshBuilderWasm.worker?worker&inline", () => ({
 	default: class MockWorker {
 		postMessage() {}
 		terminate() {}
@@ -40,6 +48,89 @@ vi.mock("./InstancedBlockRenderer");
 // WorldMeshBuilder requires complex dependencies that are difficult to mock properly.
 // Test the logic without instantiating the full class.
 describe("WorldMeshBuilder", () => {
+	function createSharedWorkerLifecycleBuilder() {
+		const context = {
+			sharedWorkerQueue: [] as Array<(worker: Worker) => void>,
+			sharedFreeWorkers: [] as Worker[],
+		};
+		const builder = Object.create(WorldMeshBuilder.prototype) as WorldMeshBuilder;
+		Object.assign(builder as any, {
+			schematicRenderer: { options: { context } },
+			useWasmMeshBuilder: true,
+			workers: [],
+			freeWorkers: context.sharedFreeWorkers,
+			workerQueue: context.sharedWorkerQueue,
+			workerWaiters: new Map(),
+			borrowedWorkers: new Set(),
+			disposed: false,
+			pendingRequests: new Map(),
+			batchPendingChunks: new Map(),
+			batchFinishResolve: null,
+			_batchFinishReject: null,
+			paletteCache: null,
+			computeMeshBuilder: null,
+			useGPUCompute: false,
+			gpuInitPromise: null,
+		});
+		return { builder, context };
+	}
+
+	describe("shared worker lifecycle", () => {
+		it("removes only its own queued waiter when disposed", async () => {
+			const { builder, context } = createSharedWorkerLifecycleBuilder();
+			const siblingWaiter = vi.fn();
+			context.sharedWorkerQueue.push(siblingWaiter);
+
+			const waiting = (builder as any).getFreeWorker() as Promise<Worker>;
+			expect(context.sharedWorkerQueue).toHaveLength(2);
+
+			builder.dispose();
+
+			await expect(waiting).rejects.toThrow("disposed before worker completion");
+			expect(context.sharedWorkerQueue).toEqual([siblingWaiter]);
+		});
+
+		it("returns an in-flight shared worker that completes after disposal", async () => {
+			const { builder, context } = createSharedWorkerLifecycleBuilder();
+			const worker = {
+				onmessage: null,
+				postMessage: vi.fn(),
+				terminate: vi.fn(),
+			} as unknown as Worker;
+			context.sharedFreeWorkers.push(worker);
+
+			const leasedWorker = (await (builder as any).getFreeWorker()) as Worker;
+			builder.dispose();
+			(leasedWorker.onmessage as ((event: MessageEvent) => void) | null)?.({
+				data: { type: "chunkBuilt", chunkId: "late" },
+			} as MessageEvent);
+
+			expect(context.sharedFreeWorkers).toEqual([worker]);
+			expect(worker.terminate).not.toHaveBeenCalled();
+		});
+
+		it("rejects a failed batch chunk and returns its shared worker", async () => {
+			const { builder, context } = createSharedWorkerLifecycleBuilder();
+			const worker = {
+				onmessage: null,
+				postMessage: vi.fn(),
+				terminate: vi.fn(),
+			} as unknown as Worker;
+			context.sharedFreeWorkers.push(worker);
+			const leasedWorker = (await (builder as any).getFreeWorker()) as Worker;
+			const failed = new Promise<void>((_resolve, reject) => {
+				(builder as any).batchPendingChunks.set("batch-1", { resolve: vi.fn(), reject });
+			});
+
+			(leasedWorker.onmessage as ((event: MessageEvent) => void) | null)?.({
+				data: { type: "error", chunkId: "batch-1", error: "batch failed" },
+			} as MessageEvent);
+
+			await expect(failed).rejects.toThrow("batch failed");
+			expect(context.sharedFreeWorkers).toEqual([worker]);
+		});
+	});
+
 	describe("chunk size validation", () => {
 		it("should have valid default chunk size", () => {
 			const DEFAULT_CHUNK_SIZE = 16;

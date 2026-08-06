@@ -28,6 +28,11 @@ export interface BlockStateDefinition {
 	multipart?: BlockStateMultipart[];
 }
 
+export type BlockStateCondition =
+	| BlockStateDefinitionVariant<string | number>
+	| { AND: BlockStateCondition[] }
+	| { OR: BlockStateCondition[] };
+
 export interface BlockStateModelHolder {
 	model: string;
 	x?: number;
@@ -37,7 +42,7 @@ export interface BlockStateModelHolder {
 }
 
 export interface BlockStateMultipart {
-	when?: BlockStateDefinitionVariant<string> | { OR: BlockStateDefinitionVariant<string>[] };
+	when?: BlockStateCondition;
 	apply: BlockStateModelHolder | BlockStateModelHolder[];
 }
 
@@ -55,6 +60,8 @@ export interface BlockModel {
 export interface BlockModelElement {
 	from: [number, number, number];
 	to: [number, number, number];
+	/** Vanilla element light emission, from 0 (normally lit) to 15 (fully emissive). */
+	light_emission?: number;
 	rotation?: {
 		origin: [number, number, number];
 		axis: "x" | "y" | "z";
@@ -96,6 +103,8 @@ export interface BlockOptimizationData {
 	// Face organization
 	cullableFaces: Map<string, OptimizedFace[]>; // direction -> faces
 	nonCullableFaces: OptimizedFace[];
+	/** Blockstate rotation for the model whose faces were analyzed. */
+	modelRotation?: { x: number; y: number };
 
 	// For batching
 	geometryTemplate?: GeometryTemplate;
