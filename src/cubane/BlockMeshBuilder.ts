@@ -11,6 +11,25 @@ interface GeometryGroup {
 	isLava?: boolean;
 }
 
+interface RenderFaceData {
+	texture: string;
+	cullface?: string;
+	rotation?: number;
+	tintindex?: number;
+	uv?: [number, number, number, number];
+	hasOppositeFace?: boolean;
+	lightEmission?: number;
+}
+
+const OPPOSITE_FACE: Record<string, string> = {
+	down: "up",
+	up: "down",
+	north: "south",
+	south: "north",
+	west: "east",
+	east: "west",
+};
+
 export class BlockMeshBuilder {
 	private assetLoader: AssetLoader;
 	// When false (default), blocks Cubane can't build render nothing instead of
@@ -313,7 +332,7 @@ export class BlockMeshBuilder {
 			{
 				faces: Array<{
 					direction: string;
-					faceData: any;
+					faceData: RenderFaceData;
 					vertices: number[][];
 					uvs: number[];
 					indices: number[];
@@ -330,17 +349,27 @@ export class BlockMeshBuilder {
 		// Process each face using the SAME logic as the working original
 		for (const [direction, faceData] of Object.entries(element.faces)) {
 			if (!faceData) continue;
+			const renderFaceData: RenderFaceData = {
+				...faceData,
+				uv:
+					faceData.uv ||
+					this.getImplicitFaceUV(direction, element.from || [0, 0, 0], element.to || [16, 16, 16]),
+				hasOppositeFace: Boolean(
+					element.faces[OPPOSITE_FACE[direction] as keyof typeof element.faces]
+				),
+				lightEmission: Number(element.light_emission || 0),
+			};
 
 			// Create a temporary PlaneGeometry to get the correct vertex positions and UVs
 			const tempFaceResult = await this.createTempFaceGeometry(
 				direction,
 				elementSize,
-				faceData,
+				renderFaceData,
 				transform
 			);
 
 			// Get material (same as before)
-			let texturePath = this.assetLoader.resolveTexture(faceData.texture, model);
+			let texturePath = this.assetLoader.resolveTexture(renderFaceData.texture, model);
 			const isWater = this.isWaterBlock(blockData);
 			const isLava = this.isLavaBlock(blockData);
 			const isLiquid = isWater || isLava;
@@ -354,7 +383,7 @@ export class BlockMeshBuilder {
 			const material = await this.createFaceMaterial(
 				texturePath,
 				direction,
-				faceData,
+				renderFaceData,
 				model,
 				blockData,
 				biome,
@@ -364,7 +393,13 @@ export class BlockMeshBuilder {
 				isLava
 			);
 
-			const materialKey = this.getMaterialKey(texturePath, direction, faceData, blockData, biome);
+			const materialKey = this.getMaterialKey(
+				texturePath,
+				direction,
+				renderFaceData,
+				blockData,
+				biome
+			);
 
 			if (!materialGroups.has(materialKey)) {
 				materialGroups.set(materialKey, {
@@ -380,7 +415,7 @@ export class BlockMeshBuilder {
 
 			materialGroups.get(materialKey)!.faces.push({
 				direction,
-				faceData,
+				faceData: renderFaceData,
 				vertices: tempFaceResult.vertices,
 				uvs: tempFaceResult.uvs,
 				indices: tempFaceResult.indices,
@@ -426,7 +461,7 @@ export class BlockMeshBuilder {
 	private async createTempFaceGeometry(
 		direction: string,
 		elementSize: number[],
-		faceData: any,
+		faceData: RenderFaceData,
 		transform: { x?: number; y?: number; uvlock?: boolean }
 	): Promise<{ vertices: number[][]; uvs: number[]; indices: number[] }> {
 		// Replicate the EXACT same logic as the working createFaceGeometry
@@ -493,7 +528,7 @@ export class BlockMeshBuilder {
 	private createIndexedGeometryFromFaces(
 		faces: Array<{
 			direction: string;
-			faceData: any;
+			faceData: RenderFaceData;
 			vertices: number[][];
 			uvs: number[];
 			indices: number[];
@@ -595,7 +630,7 @@ export class BlockMeshBuilder {
 	private async createFaceGeometry(
 		direction: string,
 		elementSize: number[],
-		faceData: any,
+		faceData: RenderFaceData,
 		model: BlockModel,
 		transform: { x?: number; y?: number; uvlock?: boolean },
 		blockData?: Block,
@@ -729,20 +764,43 @@ export class BlockMeshBuilder {
 	}
 
 	/**
+	 * Derive vanilla's implicit UV rectangle for a face. Partial elements use
+	 * their model-space bounds rather than stretching the complete texture.
+	 */
+	private getImplicitFaceUV(
+		direction: string,
+		from: readonly number[],
+		to: readonly number[]
+	): [number, number, number, number] {
+		switch (direction) {
+			case "down":
+				return [from[0], 16 - to[2], to[0], 16 - from[2]];
+			case "up":
+				return [from[0], from[2], to[0], to[2]];
+			case "north":
+				return [16 - to[0], 16 - to[1], 16 - from[0], 16 - from[1]];
+			case "south":
+				return [from[0], 16 - to[1], to[0], 16 - from[1]];
+			case "west":
+				return [from[2], 16 - to[1], to[2], 16 - from[1]];
+			case "east":
+				return [16 - to[2], 16 - to[1], 16 - from[2], 16 - from[1]];
+			default:
+				return [0, 0, 16, 16];
+		}
+	}
+
+	/**
 	 * Enhanced UV coordinate mapping that preserves face-specific logic
 	 */
 	private mapUVCoordinates(
 		geometry: THREE.PlaneGeometry,
 		direction: string,
-		faceData: any,
+		faceData: RenderFaceData,
 		transform: { x?: number; y?: number; uvlock?: boolean }
 	): void {
-		if (!faceData.uv) {
-			faceData.uv = [0, 0, 16, 16];
-		}
-
 		const uvAttribute = geometry.attributes.uv as THREE.BufferAttribute;
-		const [uMinPx, vMinPx, uMaxPx, vMaxPx] = faceData.uv;
+		const [uMinPx, vMinPx, uMaxPx, vMaxPx] = faceData.uv || [0, 0, 16, 16];
 
 		// Convert from pixel coordinates to normalized coordinates
 		const u1 = uMinPx / 16;
@@ -889,12 +947,20 @@ export class BlockMeshBuilder {
 		for (const direction of faceDirections) {
 			const faceData = element.faces[direction];
 			if (!faceData) continue;
+			const renderFaceData: RenderFaceData = {
+				...faceData,
+				uv: faceData.uv || this.getImplicitFaceUV(direction, fromJSON, toJSON),
+				hasOppositeFace: Boolean(
+					element.faces[OPPOSITE_FACE[direction] as keyof typeof element.faces]
+				),
+				lightEmission: Number(element.light_emission || 0),
+			};
 
 			// Create the face geometry (reuse existing logic)
 			const { geometry, material } = await this.createFaceGeometry(
 				direction,
 				size,
-				faceData,
+				renderFaceData,
 				model,
 				transform,
 				blockData,
@@ -905,13 +971,13 @@ export class BlockMeshBuilder {
 			this.applyElementTransforms(geometry, element, center);
 
 			// Determine if this face can be batched
-			const canBatch = this.canFaceBeBatched(element, faceData, direction);
+			const canBatch = this.canFaceBeBatched(element, renderFaceData, direction);
 
 			faces.push({
 				geometry,
 				material,
 				direction,
-				cullface: faceData.cullface,
+				cullface: renderFaceData.cullface,
 				elementBounds: [fromJSON, toJSON],
 				canBatch,
 			});
@@ -923,7 +989,11 @@ export class BlockMeshBuilder {
 	/**
 	 * Determine if a face can be batched efficiently
 	 */
-	private canFaceBeBatched(element: BlockModelElement, faceData: any, direction: string): boolean {
+	private canFaceBeBatched(
+		element: BlockModelElement,
+		faceData: RenderFaceData,
+		direction: string
+	): boolean {
 		// Faces with rotations are harder to batch
 		if (element.rotation && element.rotation.angle !== 0) {
 			return false;
@@ -1031,7 +1101,7 @@ export class BlockMeshBuilder {
 	private getMaterialKey(
 		texturePath: string,
 		direction: string,
-		faceData: any,
+		faceData: RenderFaceData,
 		blockData?: Block,
 		biome?: string
 	): string {
@@ -1042,13 +1112,13 @@ export class BlockMeshBuilder {
 			? JSON.stringify(blockData.properties) // Consider sorted stringify for consistency
 			: "none";
 
-		return `${texturePath}_dir:${direction}_tint:${tintIndex}_cull:${cullFace}_block:${blockId}_props:${props}_biome:${biome}`;
+		return `${texturePath}_dir:${direction}_tint:${tintIndex}_cull:${cullFace}_block:${blockId}_props:${props}_biome:${biome}_paired:${Boolean(faceData.hasOppositeFace)}_light:${Number(faceData.lightEmission || 0)}`;
 	}
 
 	private async createFaceMaterial(
 		texturePath: string,
 		direction: string,
-		faceData: any,
+		faceData: RenderFaceData,
 		_model: BlockModel,
 		blockData?: Block,
 		biome?: string,
@@ -1062,7 +1132,10 @@ export class BlockMeshBuilder {
 
 			// Handle tinting for blocks with tintindex
 			if (blockData && faceData.tintindex !== undefined) {
-				const blockIdForTint = `${blockData.namespace}:${blockData.name}`;
+				const blockIdForTint =
+					texturePath === "block/water_still" || texturePath === "block/water_flow"
+						? "minecraft:water"
+						: `${blockData.namespace}:${blockData.name}`;
 				tint = this.assetLoader.getTint(blockIdForTint, blockData.properties, biome);
 			}
 
@@ -1097,6 +1170,16 @@ export class BlockMeshBuilder {
 
 			// Clone the material to avoid modifying the cached version
 			const clonedMaterial = material.clone();
+			const lightEmission = Math.max(0, Math.min(15, Number(faceData.lightEmission || 0)));
+			if (lightEmission > 0 && clonedMaterial instanceof THREE.MeshStandardMaterial) {
+				clonedMaterial.emissiveMap = clonedMaterial.map;
+				clonedMaterial.emissive = new THREE.Color(0xffffff);
+				clonedMaterial.emissiveIntensity = lightEmission / 15;
+				if (lightEmission >= 15) clonedMaterial.color.set(0x000000);
+				clonedMaterial.polygonOffset = true;
+				clonedMaterial.polygonOffsetFactor = -1;
+				clonedMaterial.polygonOffsetUnits = -1;
+			}
 
 			// Determine if this should be double-sided based on element characteristics
 			const isThinElementHeuristic =
@@ -1115,6 +1198,7 @@ export class BlockMeshBuilder {
 
 			// Set sidedness based on element type
 			if (
+				!faceData.hasOppositeFace &&
 				!isRedstoneTorchElement &&
 				(isThinElementHeuristic ||
 					knownThinTexture ||
@@ -1126,8 +1210,13 @@ export class BlockMeshBuilder {
 			}
 
 			// Copy transparency and rendering properties from base material
-			clonedMaterial.transparent = material.transparent;
-			clonedMaterial.alphaTest = material.alphaTest;
+			const isOpaqueMangroveLog = /^(?:block\/)?(?:stripped_)?mangrove_log(?:_top)?$/.test(
+				texturePath
+			);
+			clonedMaterial.transparent = isOpaqueMangroveLog ? false : material.transparent;
+			clonedMaterial.alphaTest = isOpaqueMangroveLog ? 0 : material.alphaTest;
+			// Emission changes lighting, not occlusion. Opaque emissive elements still
+			// need to populate the depth buffer so geometry behind them cannot bleed through.
 			clonedMaterial.depthWrite = material.depthWrite;
 			clonedMaterial.opacity = material.opacity;
 

@@ -65,6 +65,9 @@ export class WorldMeshBuilder {
 	private workers: Worker[] = [];
 	private freeWorkers: Worker[] = [];
 	private workerQueue: ((worker: Worker) => void)[] = []; // Queue for waiting tasks
+	private workerWaiters = new Map<(worker: Worker) => void, (reason?: unknown) => void>();
+	private borrowedWorkers = new Set<Worker>();
+	private disposed = false;
 	private pendingRequests = new Map<
 		string,
 		{ resolve: (value: any) => void; reject: (reason?: any) => void; worker: Worker }
@@ -91,10 +94,8 @@ export class WorldMeshBuilder {
 		count: number;
 		worker: number;
 		buffer: number;
-		tile: number;
 		maxWorker: number;
 		maxBuffer: number;
-		maxTile: number;
 	} | null = null;
 
 	// SharedArrayBuffer for zero-copy transfers
@@ -129,7 +130,10 @@ export class WorldMeshBuilder {
 	}
 
 	private async _doInitializeGPU(): Promise<boolean> {
+		let initializingBuilder: ComputeMeshBuilder | null = null;
 		try {
+			if (this.disposed) return false;
+
 			// Check if GPU compute is enabled in options
 			const gpuOptions = this.schematicRenderer.options.gpuComputeOptions;
 			if (!gpuOptions?.enabled) {
@@ -139,14 +143,23 @@ export class WorldMeshBuilder {
 
 			// Check if WebGPU is available
 			const isAvailable = await GPUCapabilityManager.isWebGPUAvailable();
+			if (this.disposed) return false;
 			if (!isAvailable) {
 				this.initializeWorkers();
 				return false;
 			}
 
 			// Initialize compute mesh builder
-			this.computeMeshBuilder = new ComputeMeshBuilder();
-			const success = await this.computeMeshBuilder.initialize();
+			initializingBuilder = new ComputeMeshBuilder();
+			this.computeMeshBuilder = initializingBuilder;
+			const success = await initializingBuilder.initialize();
+			if (this.disposed) {
+				// dispose() may have run while initialize() was allocating GPU buffers.
+				// Dispose again after the continuation so late resources cannot escape.
+				initializingBuilder.dispose();
+				if (this.computeMeshBuilder === initializingBuilder) this.computeMeshBuilder = null;
+				return false;
+			}
 
 			if (success) {
 				this.useGPUCompute = true;
@@ -156,11 +169,14 @@ export class WorldMeshBuilder {
 				return true;
 			} else {
 				console.warn("[WorldMeshBuilder] GPU compute init failed, using worker fallback");
+				initializingBuilder.dispose();
 				this.computeMeshBuilder = null;
 				this.initializeWorkers();
 				return false;
 			}
 		} catch (error) {
+			initializingBuilder?.dispose();
+			if (this.disposed) return false;
 			console.warn("[WorldMeshBuilder] GPU compute error, using worker fallback:", error);
 			this.computeMeshBuilder = null;
 			this.initializeWorkers();
@@ -176,6 +192,7 @@ export class WorldMeshBuilder {
 	}
 
 	private initializeWorkers() {
+		if (this.disposed) return;
 		if (this.workers.length > 0) return;
 
 		// Initialize shared memory pool for zero-copy transfers
@@ -267,7 +284,6 @@ export class WorldMeshBuilder {
 	private batchPendingChunks: Map<string, { resolve: () => void; reject: (err: any) => void }> =
 		new Map();
 	private batchFinishResolve: ((data: any) => void) | null = null;
-	// @ts-expect-error Reserved for error handling in batch mode
 	private _batchFinishReject: ((err: any) => void) | null = null;
 
 	private handleWorkerMessage(worker: Worker, event: MessageEvent) {
@@ -296,6 +312,10 @@ export class WorldMeshBuilder {
 
 				// Return worker to pool
 				this.returnWorker(worker);
+			} else if (this.disposed) {
+				// A shared worker can finish after this builder rejected its request.
+				// Return that outstanding lease to the context for sibling renderers.
+				this.returnWorker(worker);
 			}
 		} else if (type === "chunkAccumulated") {
 			// Batch mode: chunk accumulated. The batch holds its worker for the whole
@@ -304,13 +324,20 @@ export class WorldMeshBuilder {
 			// onmessage, misrouting this build's remaining responses (deadlock at 0/N).
 			const request = this.batchPendingChunks.get(chunkId);
 			if (request) {
-				request.resolve();
+				if (this.disposed) request.reject(new Error("WorldMeshBuilder disposed during batch"));
+				else request.resolve();
 				this.batchPendingChunks.delete(chunkId);
+				if (this.disposed) this.returnWorker(worker);
 			}
 		} else if (type === "batchFinished") {
 			// Batch mode complete - return accumulated meshes
-			if (this.batchFinishResolve) {
-				this.batchFinishResolve(data);
+			if (this.batchFinishResolve || this._batchFinishReject) {
+				if (this.disposed) {
+					this._batchFinishReject?.(new Error("WorldMeshBuilder disposed during batch"));
+					this.returnWorker(worker);
+				} else {
+					this.batchFinishResolve?.(data);
+				}
 				this.batchFinishResolve = null;
 				this._batchFinishReject = null;
 			}
@@ -321,7 +348,19 @@ export class WorldMeshBuilder {
 					request.reject(new Error(error));
 					this.pendingRequests.delete(chunkId);
 					this.returnWorker(worker);
+				} else {
+					const batchRequest = this.batchPendingChunks.get(chunkId);
+					batchRequest?.reject(new Error(error));
+					if (batchRequest) this.batchPendingChunks.delete(chunkId);
+					if (batchRequest || this.disposed) this.returnWorker(worker);
 				}
+			} else if (this._batchFinishReject) {
+				this._batchFinishReject(new Error(error));
+				this.batchFinishResolve = null;
+				this._batchFinishReject = null;
+				this.returnWorker(worker);
+			} else if (this.disposed) {
+				this.returnWorker(worker);
 			} else {
 				console.error("[WorldMeshBuilder] Worker error:", error);
 			}
@@ -331,6 +370,17 @@ export class WorldMeshBuilder {
 	}
 
 	private returnWorker(worker: Worker) {
+		// A timeout or late worker response can try to return the same lease twice.
+		if (!this.borrowedWorkers.delete(worker)) return;
+
+		const context = this.schematicRenderer.options.context;
+		if (context && this.useWasmMeshBuilder) {
+			const resolve = context.sharedWorkerQueue.shift();
+			if (resolve) resolve(worker);
+			else if (!context.sharedFreeWorkers.includes(worker)) context.sharedFreeWorkers.push(worker);
+			return;
+		}
+
 		if (!this.workers.includes(worker)) return; // Worker might have been terminated
 
 		if (this.workerQueue.length > 0) {
@@ -361,6 +411,41 @@ export class WorldMeshBuilder {
 	}
 
 	// Removed unused isBlockOccluding method
+	private rotateOcclusionFlags(flags: number, rotation: { x?: number; y?: number } = {}): number {
+		const x = Number(rotation.x || 0);
+		const y = Number(rotation.y || 0);
+		if (x % 90 !== 0 || y % 90 !== 0) return 0;
+
+		const directions: Array<[number, number, number]> = [
+			[-1, 0, 0],
+			[1, 0, 0],
+			[0, -1, 0],
+			[0, 1, 0],
+			[0, 0, -1],
+			[0, 0, 1],
+		];
+		const bitByDirection: Record<string, number> = {
+			"-1,0,0": 0,
+			"1,0,0": 1,
+			"0,-1,0": 2,
+			"0,1,0": 3,
+			"0,0,-1": 4,
+			"0,0,1": 5,
+		};
+		const xTurns = (((x % 360) + 360) % 360) / 90;
+		const yTurns = (((y % 360) + 360) % 360) / 90;
+		let rotated = 0;
+
+		for (let bit = 0; bit < directions.length; bit++) {
+			if (!(flags & (1 << bit))) continue;
+			let [dx, dy, dz] = directions[bit];
+			for (let turn = 0; turn < xTurns; turn++) [dy, dz] = [dz, -dy];
+			for (let turn = 0; turn < yTurns; turn++) [dx, dz] = [-dz, dx];
+			rotated |= 1 << bitByDirection[[dx, dy, dz].join(",")];
+		}
+
+		return rotated;
+	}
 
 	private async computeOcclusionFlags(
 		blockString: string,
@@ -452,8 +537,12 @@ export class WorldMeshBuilder {
 				}
 			}
 
-			return flags;
-		} catch (e) {
+			const block = this.cubane.parseBlockString(blockString);
+			// Trapdoors are cutout surfaces. They must never hide the full face of
+			// an adjacent block, regardless of their open/half/facing state.
+			if (block.name.endsWith("_trapdoor")) return 0;
+			return this.rotateOcclusionFlags(flags, data.modelRotation);
+		} catch {
 			return 0;
 		}
 	}
@@ -650,16 +739,38 @@ export class WorldMeshBuilder {
 	// shared pool, responses route back to the builder that borrowed the worker
 	// (workers are lent exclusively until returnWorker).
 	private async getFreeWorker(): Promise<Worker> {
+		if (this.disposed) throw new Error("WorldMeshBuilder disposed while waiting for a worker");
+
 		const bind = (worker: Worker): Worker => {
 			worker.onmessage = (event: MessageEvent) => this.handleWorkerMessage(worker, event);
+			this.borrowedWorkers.add(worker);
 			return worker;
 		};
 		if (this.freeWorkers.length > 0) {
 			return bind(this.freeWorkers.pop()!);
 		}
 		// Wait for a worker to become free
-		return new Promise<Worker>((resolve) => {
-			this.workerQueue.push((worker) => resolve(bind(worker)));
+		return new Promise<Worker>((resolve, reject) => {
+			const waiter = (worker: Worker) => {
+				this.workerWaiters.delete(waiter);
+				if (this.disposed) {
+					// Disposal may race a sibling returning a shared worker. Hand the lease
+					// straight back instead of binding it to this dead builder.
+					const context = this.schematicRenderer.options.context;
+					if (context && this.useWasmMeshBuilder) {
+						const next = context.sharedWorkerQueue.shift();
+						if (next) next(worker);
+						else if (!context.sharedFreeWorkers.includes(worker)) {
+							context.sharedFreeWorkers.push(worker);
+						}
+					}
+					reject(new Error("WorldMeshBuilder disposed while waiting for a worker"));
+					return;
+				}
+				resolve(bind(worker));
+			};
+			this.workerWaiters.set(waiter, reject);
+			this.workerQueue.push(waiter);
 		});
 	}
 
@@ -709,6 +820,7 @@ export class WorldMeshBuilder {
 		const batchWorker = await this.getFreeWorker();
 		try {
 			for (let subBatchIdx = 0; subBatchIdx < numSubBatches; subBatchIdx++) {
+				if (this.disposed) throw new Error("WorldMeshBuilder disposed during batch");
 				const subBatchStart = subBatchIdx * SUB_BATCH_SIZE;
 				const subBatchEnd = Math.min(subBatchStart + SUB_BATCH_SIZE, totalChunks);
 				const subBatchChunks = allChunks.slice(subBatchStart, subBatchEnd);
@@ -718,6 +830,7 @@ export class WorldMeshBuilder {
 
 				// Process this sub-batch's chunks through the batch worker
 				for (const chunkData of subBatchChunks) {
+					if (this.disposed) throw new Error("WorldMeshBuilder disposed during batch");
 					const chunkId = `batch_${chunkData.chunk_x}_${chunkData.chunk_y}_${chunkData.chunk_z}`;
 
 					// Convert blocks to Int32Array if needed
@@ -1089,8 +1202,14 @@ export class WorldMeshBuilder {
 				this.initializeWorkers();
 			}
 
-			// Get a free worker
-			const worker = await this.getFreeWorker();
+			// Get a free worker. The wait is cancellable when this builder is disposed.
+			let worker: Worker;
+			try {
+				worker = await this.getFreeWorker();
+			} catch (error) {
+				reject(error);
+				return;
+			}
 
 			// Add timeout to prevent hanging
 			const timeoutId = setTimeout(() => {
@@ -1247,13 +1366,13 @@ export class WorldMeshBuilder {
 			// Neighbouring chunks' boundary blocks for cross-chunk face culling (occlusion only).
 			apronBlocks?: Int32Array;
 		},
-		schematicObject: SchematicObject,
+		_schematicObject: SchematicObject,
 		renderingBounds?: {
 			min: THREE.Vector3;
 			max: THREE.Vector3;
 			enabled?: boolean;
 		},
-		preFilteredEntities?: any[] // Optimization: entities already filtered by WASM
+		_preFilteredEntities?: any[] // Kept for API compatibility; block entities use dedicated passes.
 	): Promise<THREE.Object3D[]> {
 		const chunkId = `${chunkData.chunk_x},${chunkData.chunk_y},${chunkData.chunk_z}`;
 
@@ -1305,107 +1424,9 @@ export class WorldMeshBuilder {
 
 		if (blocksToProcess.length === 0) return [];
 
-		// Identify tile entities separately - Optimized
-		const tileEntityBlocks: any[] = [];
-		// Optimization: Pass all blocks to worker directly. Worker filters invisible blocks.
+		// Pass all blocks to worker directly. Worker filters invisible blocks. NBT-aware
+		// blocks are rendered by dedicated sign and block-entity overlay passes.
 		const workerBlocks = blocksToProcess;
-
-		// Use cached map from SchematicObject instead of fetching all entities every chunk
-		// If preFilteredEntities is provided (WASM optimized path), use that directly
-
-		if (preFilteredEntities) {
-			for (const entity of preFilteredEntities) {
-				// With WASM getChunkData, we get entity ID but not the full block state string.
-				// However, the block at this position determines the visual appearance.
-				// We need to query the block state to handle rotation/variants properly.
-
-				// Note: entity.position from getChunkData is [x, y, z]
-				const pos = entity.position; // [x, y, z]
-
-				// Bounds checking is already done by WASM, but double check against renderingBounds if needed
-				// (WASM getChunkData cuts by chunk, but renderingBounds might be tighter)
-				if (renderingBounds?.enabled) {
-					if (
-						pos[0] < renderingBounds.min.x ||
-						pos[0] >= renderingBounds.max.x ||
-						pos[1] < renderingBounds.min.y ||
-						pos[1] >= renderingBounds.max.y ||
-						pos[2] < renderingBounds.min.z ||
-						pos[2] >= renderingBounds.max.z
-					) {
-						continue;
-					}
-				}
-
-				const blockName = schematicObject.schematicWrapper.get_block(pos[0], pos[1], pos[2]);
-
-				if (
-					// Signs are handled by the mode-independent buildSignMeshes pass.
-					blockName &&
-					(blockName.includes("chest") || blockName.includes("banner"))
-				) {
-					tileEntityBlocks.push({
-						x: pos[0],
-						y: pos[1],
-						z: pos[2],
-						paletteIndex: -1,
-						blockName: blockName,
-						nbtData: entity, // The entity structure from WASM is compatible enough or we use it as is
-					});
-				}
-			}
-		} else {
-			// Fallback: JS-side filtering using cached spatial index
-			const blockEntityMap = schematicObject.getBlockEntitiesMap();
-
-			// Only scan for entities if map is not empty and reasonably sized
-			// For very large entity maps, skip to avoid O(E*C) complexity
-			if (blockEntityMap.size > 0 && blockEntityMap.size < 10000) {
-				// Use spatial cache if available, otherwise build it once
-				let spatialCache = (schematicObject as any)._entitySpatialCache as
-					| Map<string, any[]>
-					| undefined;
-
-				if (!spatialCache) {
-					spatialCache = new Map<string, any[]>();
-					for (const [, entity] of blockEntityMap) {
-						const pos = entity.position;
-						const chunkKey = `${Math.floor(pos[0] / this.chunkSize)},${Math.floor(pos[1] / this.chunkSize)},${Math.floor(pos[2] / this.chunkSize)}`;
-						if (!spatialCache.has(chunkKey)) {
-							spatialCache.set(chunkKey, []);
-						}
-						spatialCache.get(chunkKey)!.push(entity);
-					}
-					(schematicObject as any)._entitySpatialCache = spatialCache;
-				}
-
-				// O(1) lookup for this chunk's entities
-				const chunkKey = `${chunkData.chunk_x},${chunkData.chunk_y},${chunkData.chunk_z}`;
-				const chunkEntities = spatialCache.get(chunkKey);
-
-				if (chunkEntities && chunkEntities.length > 0) {
-					for (const entity of chunkEntities) {
-						const pos = entity.position;
-						const blockName = schematicObject.schematicWrapper.get_block(pos[0], pos[1], pos[2]);
-
-						if (
-							// Signs are handled by the mode-independent buildSignMeshes pass.
-							blockName &&
-							(blockName.includes("chest") || blockName.includes("banner"))
-						) {
-							tileEntityBlocks.push({
-								x: pos[0],
-								y: pos[1],
-								z: pos[2],
-								paletteIndex: -1,
-								blockName: blockName,
-								nbtData: entity,
-							});
-						}
-					}
-				}
-			}
-		}
 
 		// Determine chunk origin
 		const originX = chunkData.chunk_x * this.chunkSize;
@@ -1418,7 +1439,6 @@ export class WorldMeshBuilder {
 		const timings = {
 			workerDispatch: 0,
 			bufferGeometry: 0,
-			tileEntities: 0,
 		};
 		let timingStart = performance.now();
 
@@ -1462,8 +1482,14 @@ export class WorldMeshBuilder {
 				// TIMING: Measure getFreeWorker wait time
 				const getFreeWorkerStart = performance.now();
 
-				// Get a free worker
-				const worker = await this.getFreeWorker();
+				// Get a free worker. The wait is cancellable when this builder is disposed.
+				let worker: Worker;
+				try {
+					worker = await this.getFreeWorker();
+				} catch (error) {
+					reject(error);
+					return;
+				}
 
 				const getFreeWorkerTime = performance.now() - getFreeWorkerStart;
 				if (getFreeWorkerTime > 10) {
@@ -1624,56 +1650,6 @@ export class WorldMeshBuilder {
 				}
 			}
 			timings.bufferGeometry = performance.now() - timingStart;
-			timingStart = performance.now();
-
-			// Process tile entities (Main Thread)
-			if (tileEntityBlocks.length > 0) {
-				// const palette = this.paletteCache.palette; // Not needed if we use blockName
-				for (const tileBlock of tileEntityBlocks) {
-					const { x, y, z, paletteIndex, blockName, nbtData } = tileBlock;
-
-					// If we have direct blockName, use it. Otherwise look up via paletteIndex (legacy path)
-					let blockString = "";
-					if (blockName) {
-						blockString = blockName;
-						// Note: We might need properties. get_block returns just name?
-						// get_block returns full state string "minecraft:chest[facing=north]" usually?
-						// Actually nucleation get_block returns just name or state?
-						// Let's assume we might need to fetch full state if get_block returns only "minecraft:chest"
-
-						// Optimization: If needed, we can assume 'blockName' from the loop above is sufficient
-						// or fetch properties if missing.
-					} else if (paletteIndex >= 0) {
-						const blockState = this.paletteCache.palette[paletteIndex];
-						blockString = this.createBlockStringFromPaletteEntry(blockState);
-					}
-
-					if (blockString) {
-						try {
-							// const blockString = this.createBlockStringFromPaletteEntry(blockState);
-							const customMesh = await this.cubane.getBlockMesh(
-								blockString,
-								"plains",
-								false,
-								nbtData.nbt || nbtData
-							);
-							if (customMesh) {
-								const currentOffset = customMesh.position.clone();
-								customMesh.position.set(
-									x + currentOffset.x,
-									y + currentOffset.y,
-									z + currentOffset.z
-								);
-								customMesh.name = `tile_entity_${blockString}_${x}_${y}_${z}`;
-								resultMeshes.push(customMesh);
-							}
-						} catch (e) {
-							console.warn("Tile entity error", e);
-						}
-					}
-				}
-			}
-			timings.tileEntities = performance.now() - timingStart;
 		} catch (error) {
 			console.error("Error building chunk mesh:", error);
 		}
@@ -1684,24 +1660,20 @@ export class WorldMeshBuilder {
 				count: 0,
 				worker: 0,
 				buffer: 0,
-				tile: 0,
 				maxWorker: 0,
 				maxBuffer: 0,
-				maxTile: 0,
 			};
 		}
 		this._timingStats.count++;
 		this._timingStats.worker += timings.workerDispatch;
 		this._timingStats.buffer += timings.bufferGeometry;
-		this._timingStats.tile += timings.tileEntities;
 		this._timingStats.maxWorker = Math.max(this._timingStats.maxWorker, timings.workerDispatch);
 		this._timingStats.maxBuffer = Math.max(this._timingStats.maxBuffer, timings.bufferGeometry);
-		this._timingStats.maxTile = Math.max(this._timingStats.maxTile, timings.tileEntities);
 
 		if (this._timingStats.count % 10 === 0) {
 			const n = this._timingStats.count;
 			console.log(
-				`[ChunkTiming n=${n}] avg: worker=${(this._timingStats.worker / n).toFixed(1)}ms, buffer=${(this._timingStats.buffer / n).toFixed(1)}ms, tile=${(this._timingStats.tile / n).toFixed(1)}ms | max: w=${this._timingStats.maxWorker.toFixed(0)}, b=${this._timingStats.maxBuffer.toFixed(0)}, t=${this._timingStats.maxTile.toFixed(0)}`
+				`[ChunkTiming n=${n}] avg: worker=${(this._timingStats.worker / n).toFixed(1)}ms, buffer=${(this._timingStats.buffer / n).toFixed(1)}ms | max: w=${this._timingStats.maxWorker.toFixed(0)}, b=${this._timingStats.maxBuffer.toFixed(0)}`
 			);
 		}
 
@@ -1903,14 +1875,36 @@ export class WorldMeshBuilder {
 	}
 
 	public dispose(): void {
+		if (this.disposed) return;
+		this.disposed = true;
+		const disposalError = new Error("WorldMeshBuilder disposed before worker completion");
+
 		// Reject any pending requests before destroying workers
-		this.pendingRequests.forEach((request, chunkId) => {
-			request.reject(new Error(`Worker terminated before processing chunk ${chunkId}`));
+		this.pendingRequests.forEach((request) => {
+			request.reject(disposalError);
 		});
 		this.pendingRequests.clear();
 
-		// Clear worker queue
-		this.workerQueue = [];
+		// Remove only this builder's waiters. In shared mode the queue belongs to the
+		// context; replacing/clearing it would either leak our callbacks or cancel
+		// sibling renderers' work.
+		for (const [waiter, reject] of this.workerWaiters) {
+			const index = this.workerQueue.indexOf(waiter);
+			if (index >= 0) this.workerQueue.splice(index, 1);
+			reject(disposalError);
+		}
+		this.workerWaiters.clear();
+
+		const usesSharedWorkers = Boolean(
+			this.schematicRenderer.options.context && this.useWasmMeshBuilder
+		);
+		if (!usesSharedWorkers) {
+			this.batchPendingChunks.forEach((request) => request.reject(disposalError));
+			this.batchPendingChunks.clear();
+			this._batchFinishReject?.(disposalError);
+			this.batchFinishResolve = null;
+			this._batchFinishReject = null;
+		}
 
 		if (this.paletteCache) {
 			this.paletteCache.blockData.forEach((blockData) => {
@@ -1934,8 +1928,9 @@ export class WorldMeshBuilder {
 		// Terminate workers only if we own them. A shared-context pool is owned by
 		// the context (and terminated when it disposes), so a context-backed builder
 		// must not terminate workers still used by sibling renderers.
-		if (!this.schematicRenderer.options.context) {
+		if (!usesSharedWorkers) {
 			this.workers.forEach((w) => w.terminate());
+			this.borrowedWorkers.clear();
 		}
 		this.workers = [];
 		this.freeWorkers = [];

@@ -240,6 +240,64 @@ const options = {
 const renderer = new SchematicRenderer.SchematicRenderer(canvas, {}, {}, options);
 ```
 
+## NBT-backed block entities
+
+Block-entity overlays are enabled by default. Bundled renderers cover player heads, banners, decorated pots, copper chests, and every shulker-box color. Their models use the active resource pack, so that pack must contain the matching entity and block-entity textures.
+
+Custom player skins require an application-owned resolver. The library extracts and validates texture hashes or profile identifiers from schematic NBT, but never contacts Mojang or another remote service by itself. Without a resolver, player heads use a neutral fallback material. A resolver can receive `default`, `texture-hash`, or `profile` references; profile resolution and its optional `fallbackIdentifier` remain application responsibilities. It must honor `signal` and `maxBytes`, and return a PNG `Blob` or `null`.
+
+```typescript
+const renderer = new SchematicRenderer(
+	canvas,
+	{},
+	{},
+	{
+		blockEntityOptions: {
+			playerHeads: {
+				resolveTexture: async (reference, { signal, maxBytes }) => {
+					const response = await fetch(
+						`/head-texture?reference=${encodeURIComponent(JSON.stringify(reference))}`,
+						{ signal }
+					);
+					if (!response.ok) return null;
+
+					const texture = await response.blob();
+					return texture.size <= maxBytes ? texture : null;
+				},
+			},
+			onError: (rendererId, error) => {
+				console.warn(`Block-entity renderer ${rendererId} failed`, error);
+			},
+		},
+	}
+);
+```
+
+Applications can append renderers through `blockEntityOptions.renderers`, or register them later:
+
+```typescript
+const unregister = renderer.blockEntityRenderers.register({
+	id: "my-block-entity", // Must be unique.
+	blockIds: ["minecraft:my_block"],
+	blockEntityIds: ["minecraft:my_block_entity"],
+	async render({ signal }) {
+		if (signal.aborted) return null;
+		return {
+			count: 0,
+			dispose() {
+				// Release every object and GPU resource created by this renderer.
+			},
+		};
+	},
+});
+```
+
+`blockIds` and `blockEntityIds` are OR filters; `matches` can add a stricter check. Renderer IDs must be unique. Renderers must observe `signal` promptly and return a synchronous, idempotent `dispose`. Models and textures returned by `resources` are borrowed: clone them before mutation and never dispose the borrowed originals.
+
+Registry changes affect the next render pass. Call `schematic.rebuildBlockEntities()` for each already loaded schematic after registering/unregistering a renderer or changing NBT through `setBlockWithNbt`/`setBlockNoRebuild`. `setBlock` and `setBlocks` refresh overlays automatically. Set `blockEntityOptions.enabled` to `false` to disable overlays, or `includeDefaultRenderers` to `false` to use only custom renderers.
+
+One shared snapshot is captured per pass. Defaults cap it at 65,536 palette entries, 1,000,000 indexed blocks, and 16,384 block entities; excess entries are intentionally ignored. Override these limits with `blockEntityOptions.snapshotOptions` when trusted schematics require more. Player-head resolution is asynchronous, so resolver latency also delays `getMeshes()` and `onSchematicRendered`.
+
 ## Callbacks
 
 The renderer provides extensive callbacks for hooking into lifecycle events, user interactions, and loading states.

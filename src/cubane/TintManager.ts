@@ -4,6 +4,7 @@ import * as THREE from "three";
 // no colormap textures.
 const DEFAULT_GRASS = new THREE.Color(0x91bd59);
 const DEFAULT_FOLIAGE = new THREE.Color(0x77ab2f);
+const DEFAULT_DRY_FOLIAGE = new THREE.Color(0x5c3c32);
 const DEFAULT_WATER = new THREE.Color(0x3f76e4);
 
 // A few leaf types use a fixed colour in vanilla rather than a biome sample.
@@ -32,6 +33,7 @@ export class TintManager {
 	// Minecraft grass/foliage colormaps (256×256), null until a pack supplies them.
 	private grassColormap: ImageData | null = null;
 	private foliageColormap: ImageData | null = null;
+	private dryFoliageColormap: ImageData | null = null;
 
 	// Register built-in tintable blocks
 	constructor() {
@@ -75,11 +77,18 @@ export class TintManager {
 	}
 
 	isTintable(blockId: string): boolean {
-		return this.tintableBlocks.has(blockId);
+		return this.getTintType(blockId) !== null;
 	}
 
 	getTintType(blockId: string): string | null {
-		return this.tintableBlocks.get(blockId) || null;
+		return (
+			this.tintableBlocks.get(blockId) ||
+			(blockId === "minecraft:leaf_litter"
+				? "dry_foliage"
+				: blockId !== "minecraft:dead_bush" && /(?::bush|_bush|_leaves)$/.test(blockId)
+					? "foliage"
+					: null)
+		);
 	}
 
 	// Calculate tint color based on block type and properties
@@ -96,6 +105,8 @@ export class TintManager {
 				return this.getRedstoneTint(properties.power || "0");
 			case "foliage":
 				return this.getFoliageTint(blockId, biome);
+			case "dry_foliage":
+				return this.getDryFoliageTint(biome);
 			case "water":
 				return this.getWaterTint(biome);
 			case "stem":
@@ -118,9 +129,14 @@ export class TintManager {
 	 * Supply the decoded grass/foliage colormaps (or null to clear). Called by the
 	 * AssetLoader once textures are available.
 	 */
-	public setColormaps(grass: ImageData | null, foliage: ImageData | null): void {
+	public setColormaps(
+		grass: ImageData | null,
+		foliage: ImageData | null,
+		dryFoliage: ImageData | null = null
+	): void {
 		this.grassColormap = grass;
 		this.foliageColormap = foliage;
+		this.dryFoliageColormap = dryFoliage;
 	}
 
 	/**
@@ -168,6 +184,10 @@ export class TintManager {
 		// Vanilla water tint is a per-biome constant (no gradient colormap). Most
 		// biomes share the default; use it for all until per-biome water is needed.
 		return DEFAULT_WATER.clone();
+	}
+
+	private getDryFoliageTint(biome: string = "plains"): THREE.Color {
+		return this.sampleColormap(this.dryFoliageColormap, biome, DEFAULT_DRY_FOLIAGE);
 	}
 
 	private getStemTint(age: string): THREE.Color {

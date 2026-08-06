@@ -25,6 +25,7 @@ export { FlyControls } from "./managers/FlyControls";
 export type { FlyControlsOptions, FlyControlsKeybinds } from "./managers/FlyControls";
 export { InspectorManager } from "./managers/InspectorManager";
 export { ResourcePackManagerProxy } from "./managers/ResourcePackManagerProxy";
+export * from "./block-entities/index";
 // Sidebar UI exports
 export { SidebarManager } from "./ui/sidebar/SidebarManager";
 export { UnifiedSidebar } from "./ui/sidebar/UnifiedSidebar";
@@ -47,6 +48,7 @@ export type {
 	DebugOptions,
 	GPUComputeOptions,
 	WasmMeshBuilderOptions,
+	BlockEntityRenderingOptions,
 } from "./SchematicRendererOptions";
 export type {
 	InsignRegionStyle,

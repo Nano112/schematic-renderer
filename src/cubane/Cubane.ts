@@ -67,28 +67,6 @@ export class Cubane {
 		// Note: "minecraft:bell" is removed from here as it's now hybrid
 	};
 
-	private getShulkerBoxEntityMap(): Record<string, string> {
-		// Returns a map of shulker box colors to their entity type
-		return {
-			"minecraft:white_shulker_box": "shulker_box",
-			"minecraft:orange_shulker_box": "shulker_box",
-			"minecraft:magenta_shulker_box": "shulker_box",
-			"minecraft:light_blue_shulker_box": "shulker_box",
-			"minecraft:yellow_shulker_box": "shulker_box",
-			"minecraft:lime_shulker_box": "shulker_box",
-			"minecraft:pink_shulker_box": "shulker_box",
-			"minecraft:gray_shulker_box": "shulker_box",
-			"minecraft:light_gray_shulker_box": "shulker_box",
-			"minecraft:cyan_shulker_box": "shulker_box",
-			"minecraft:purple_shulker_box": "shulker_box",
-			"minecraft:blue_shulker_box": "shulker_box",
-			"minecraft:brown_shulker_box": "shulker_box",
-			"minecraft:green_shulker_box": "shulker_box",
-			"minecraft:red_shulker_box": "shulker_box",
-			"minecraft:black_shulker_box": "shulker_box",
-		};
-	}
-
 	// New map for hybrid blocks: blockId -> configuration for its dynamic part(s)
 	private hybridBlockConfig: Record<string, HybridBlockDynamicPart[]> = {
 		"minecraft:lectern": [
@@ -162,12 +140,6 @@ export class Cubane {
 			}
 			this.initialized = true;
 		})();
-
-		// Register shulker box entities
-		const shulkerBoxEntityMap = this.getShulkerBoxEntityMap();
-		for (const [blockId, entityType] of Object.entries(shulkerBoxEntityMap)) {
-			this.registerBlockEntity(blockId, entityType);
-		}
 
 		// Signs are handled by SignRenderer (see getBlockMesh), not registered as
 		// GLTF block entities.
@@ -839,7 +811,24 @@ export class Cubane {
 				try {
 					const dynamicMesh = await this.getEntityMesh(partConfig.entityType, useCache);
 					if (dynamicMesh) {
-						if (partConfig.offset) {
+						if (blockId === "minecraft:lectern") {
+							// Vanilla only renders the book for occupied lecterns. Align the
+							// entity model with the sloped top and the block's facing.
+							if (block.properties.has_book !== "true") continue;
+							const facingRotation: Record<string, number> = {
+								north: 0,
+								east: -90,
+								south: 180,
+								west: 90,
+							};
+							dynamicMesh.position.set(0, 9 / 16, 0);
+							dynamicMesh.rotation.order = "YXZ";
+							dynamicMesh.rotation.set(
+								THREE.MathUtils.degToRad(67.5),
+								THREE.MathUtils.degToRad(facingRotation[block.properties.facing || "north"] || 0),
+								0
+							);
+						} else if (partConfig.offset) {
 							dynamicMesh.position.set(
 								partConfig.offset[0] - 0.5, // Assuming hybrid offsets are 0-1, convert to -0.5 to 0.5 if block is centered
 								partConfig.offset[1] - 0.5,
@@ -850,7 +839,7 @@ export class Cubane {
 								// Or, if offsets are in MC coords (0-16), divide by 16 then subtract 0.5.
 							);
 						}
-						if (partConfig.rotation) {
+						if (blockId !== "minecraft:lectern" && partConfig.rotation) {
 							dynamicMesh.rotation.set(
 								THREE.MathUtils.degToRad(partConfig.rotation[0]),
 								THREE.MathUtils.degToRad(partConfig.rotation[1]),
@@ -1095,6 +1084,10 @@ export class Cubane {
 			hasCullableFaces: faceData.cullableFaces.size > 0,
 			cullableFaces: faceData.cullableFaces,
 			nonCullableFaces: faceData.nonCullableFaces,
+			modelRotation: {
+				x: primaryModel.x || 0,
+				y: primaryModel.y || 0,
+			},
 		};
 	}
 

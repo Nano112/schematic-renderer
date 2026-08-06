@@ -15,11 +15,13 @@ import { EventEmitter } from "events";
 import { SceneManager } from "./SceneManager";
 // Removed unused imports since we're no longer using reactive proxy
 import { resetPerformanceMetrics } from "../monitoring";
+import { disposeGroup, disposeMesh } from "../utils/MemoryLeakFix";
 import { SchematicRenderer } from "../SchematicRenderer";
 import type { BlockData } from "../types";
 import { performanceMonitor } from "../performance/PerformanceMonitor";
 import { SchematicExporter } from "../export/SchematicExporter";
 import type { ExportOptions, ExportFormat, ExportResult } from "../types/export";
+import type { BlockEntityOverlay } from "../block-entities/index";
 
 // Define chunk data interface to fix TypeScript errors
 
@@ -75,6 +77,9 @@ export class SchematicObject extends EventEmitter {
 	// Cache for dimensions to avoid repeated calls
 	private _cachedDimensions: [number, number, number] | null = null;
 	private blockEntitiesMap: Map<string, any> | null = null;
+	private disposed = false;
+	private blockEntityOverlay: BlockEntityOverlay | null = null;
+	private blockEntityAbortController: AbortController | null = null;
 
 	constructor(
 		schematicRenderer: SchematicRenderer,
@@ -323,7 +328,6 @@ export class SchematicObject extends EventEmitter {
 	 * This avoids interference with Three.js internal matrix properties
 	 */
 	// Timer is assigned in setupPropertyWatchers and used internally
-	// @ts-expect-error Timer is assigned and used internally for change detection
 	private _propertyWatcherTimer: ReturnType<typeof setTimeout> | null = null;
 
 	private setupPropertyWatchers(): void {
@@ -336,6 +340,8 @@ export class SchematicObject extends EventEmitter {
 
 		// Set up property change detection
 		const checkForChanges = () => {
+			if (this.disposed) return;
+
 			// Check position
 			if (!this.position.equals(lastPosition)) {
 				lastPosition = this.position.clone();
@@ -372,7 +378,9 @@ export class SchematicObject extends EventEmitter {
 			}
 
 			// Continue checking periodically - use longer interval (250ms) to reduce overhead
-			this._propertyWatcherTimer = setTimeout(checkForChanges, 250);
+			if (!this.disposed) {
+				this._propertyWatcherTimer = setTimeout(checkForChanges, 250);
+			}
 		};
 
 		// Start the change detection loop
@@ -636,11 +644,27 @@ export class SchematicObject extends EventEmitter {
 	}
 
 	private async buildMeshes(): Promise<void> {
-		if (!this.visible) {
+		if (!this.visible || this.disposed) {
 			return;
 		}
 
-		const { meshes, chunkMap } = await this.buildSchematicMeshes(this, this.chunkDimensions);
+		let meshes: THREE.Object3D[];
+		let chunkMap: Map<string, THREE.Object3D[]>;
+		try {
+			const result = await this.buildSchematicMeshes(this, this.chunkDimensions);
+			meshes = result.meshes;
+			chunkMap = result.chunkMap;
+		} catch (error) {
+			// Disposing WorldMeshBuilder rejects its pending worker requests. A build
+			// cancelled by teardown is expected and must not become an unhandled rejection.
+			if (this.disposed) return;
+			throw error;
+		}
+
+		if (this.disposed) {
+			this.disposeObjects([...meshes, ...Array.from(chunkMap.values()).flat()]);
+			return;
+		}
 		this.chunkMeshes = chunkMap;
 
 		// Sign block entities are rendered in a mode-independent pass (the batched/
@@ -648,9 +672,22 @@ export class SchematicObject extends EventEmitter {
 		// per-instance NBT text and blockstate facing/rotation).
 		try {
 			const signMeshes = await this.worldMeshBuilder.buildSignMeshes(this);
+			if (this.disposed) {
+				this.disposeObjects([...(signMeshes as THREE.Object3D[]), ...meshes]);
+				return;
+			}
 			meshes.push(...(signMeshes as THREE.Mesh[]));
 		} catch (e) {
+			if (this.disposed) {
+				this.disposeObjects(meshes);
+				return;
+			}
 			console.warn("[SchematicObject] sign build failed", e);
+		}
+
+		if (this.disposed) {
+			this.disposeObjects(meshes);
+			return;
 		}
 
 		// Apply properties to all objects
@@ -664,6 +701,9 @@ export class SchematicObject extends EventEmitter {
 		this.updateTransform(); // This will apply position, rotation, and scale to the group
 		this.group.visible = this.visible;
 		this.meshes = meshes as THREE.Mesh[]; // Keep for backward compatibility
+
+		if (!(await this.renderBlockEntityOverlay())) return;
+		if (this.opacity !== 1) this.updateMeshMaterials("opacity");
 
 		this.group.updateMatrixWorld(true);
 		this.group.updateWorldMatrix(true, true);
@@ -1748,6 +1788,134 @@ export class SchematicObject extends EventEmitter {
 		return Array.from(this.group.children);
 	}
 
+	private disposeBlockEntityOverlay(): void {
+		const controller = this.blockEntityAbortController;
+		const overlay = this.blockEntityOverlay;
+		this.blockEntityAbortController = null;
+		this.blockEntityOverlay = null;
+		controller?.abort();
+		overlay?.dispose();
+	}
+
+	private async renderBlockEntityOverlay(): Promise<boolean> {
+		this.disposeBlockEntityOverlay();
+		if (this.disposed) return false;
+
+		const options = this.schematicRenderer.options.blockEntityOptions;
+		const registry = this.schematicRenderer.blockEntityRenderers;
+		if (options?.enabled === false || registry.size === 0) return true;
+
+		const controller = new AbortController();
+		this.blockEntityAbortController = controller;
+		try {
+			const overlay = await registry.render(
+				this,
+				{
+					getEntityMesh: (entityType, useCache) =>
+						this.schematicRenderer.cubane.getEntityMesh(entityType, useCache),
+					getTexture: (texturePath) =>
+						this.schematicRenderer.cubane.getAssetLoader().getTexture(texturePath),
+				},
+				controller.signal,
+				{
+					snapshotOptions: options?.snapshotOptions,
+					onError: options?.onError,
+				}
+			);
+
+			if (
+				this.disposed ||
+				controller.signal.aborted ||
+				this.blockEntityAbortController !== controller
+			) {
+				overlay.dispose();
+				return false;
+			}
+			this.blockEntityOverlay = overlay;
+			return true;
+		} catch (error) {
+			const isCurrent = this.blockEntityAbortController === controller;
+			const wasCancelled = controller.signal.aborted || !isCurrent;
+			if (isCurrent) {
+				this.blockEntityAbortController = null;
+			}
+			controller.abort();
+			if (this.disposed || wasCancelled) return false;
+			if (options?.onError) {
+				try {
+					options.onError("registry", error);
+				} catch (callbackError) {
+					console.warn("[SchematicObject] block-entity error callback failed", callbackError);
+				}
+			} else {
+				console.warn("[SchematicObject] block-entity build failed", error);
+			}
+			return true;
+		}
+	}
+
+	private async refreshBlockEntityOverlay(): Promise<void> {
+		if (!(await this.renderBlockEntityOverlay()) || this.disposed) return;
+		if (this.opacity !== 1) this.updateMeshMaterials("opacity");
+		this.schematicRenderer.invalidate();
+	}
+
+	private disposeObjects(objects: Iterable<THREE.Object3D>): void {
+		for (const object of new Set(objects)) {
+			if (object.parent) object.parent.remove(object);
+			if (object instanceof THREE.Group) {
+				disposeGroup(object);
+			} else if (object instanceof THREE.Mesh || object instanceof THREE.InstancedMesh) {
+				disposeMesh(object);
+			} else {
+				// Helpers and line objects can also own GPU geometry/material resources.
+				const disposable = object as THREE.Object3D & {
+					geometry?: THREE.BufferGeometry;
+					material?: THREE.Material | THREE.Material[];
+				};
+				disposable.geometry?.dispose();
+				const materials = disposable.material
+					? Array.isArray(disposable.material)
+						? disposable.material
+						: [disposable.material]
+					: [];
+				materials.forEach((material) => material.dispose());
+			}
+		}
+	}
+
+	/** Re-read NBT and rebuild only the NBT-aware overlay. */
+	public async rebuildBlockEntities(): Promise<void> {
+		await this.refreshBlockEntityOverlay();
+	}
+
+	/** Release timers, scene references, and every GPU object owned by this schematic. */
+	public dispose(): void {
+		if (this.disposed) return;
+		this.disposed = true;
+
+		if (this._propertyWatcherTimer !== null) {
+			clearTimeout(this._propertyWatcherTimer);
+			this._propertyWatcherTimer = null;
+		}
+		this.disposeBlockEntityOverlay();
+
+		this.disposeObjects([
+			...this.group.children,
+			...this.meshes,
+			...Array.from(this.chunkMeshes.values()).flat(),
+		]);
+		this.group.clear();
+		this.group.parent?.remove(this.group);
+		this.group.userData = {};
+		this.renderingBounds.helper = undefined;
+		this.chunkMeshes.clear();
+		this.meshes = [];
+		this.blockEntitiesMap?.clear();
+		this.blockEntitiesMap = null;
+		this.removeAllListeners();
+	}
+
 	// Update chunk management methods to handle Object3D
 	public getChunkObjectsAt(
 		chunkX: number,
@@ -1804,6 +1972,7 @@ export class SchematicObject extends EventEmitter {
 	}
 
 	public async updateMesh() {
+		this.disposeBlockEntityOverlay();
 		// Remove old meshes from the scene
 		this.meshes.forEach((mesh) => {
 			this.group.remove(mesh);
@@ -1824,6 +1993,7 @@ export class SchematicObject extends EventEmitter {
 
 	public async rebuildMesh() {
 		performanceMonitor.startOperation(`rebuildMesh-${this.name}`);
+		this.disposeBlockEntityOverlay();
 
 		// Show progress bar if enabled in renderer options
 		const renderer = this.sceneManager?.schematicRenderer;
@@ -2320,6 +2490,8 @@ export class SchematicObject extends EventEmitter {
 		}
 
 		this.schematicWrapper.setBlockWithNbt(position.x, position.y, position.z, blockType, nbtData);
+		this._cachedDimensions = null;
+		this.blockEntitiesMap = null;
 		performanceMonitor.endOperation("setBlockWithNbt");
 	}
 
@@ -2343,6 +2515,7 @@ export class SchematicObject extends EventEmitter {
 		await this.setBlockNoRebuild(position, blockType);
 
 		await this.rebuildChunkAtPosition(position);
+		await this.refreshBlockEntityOverlay();
 	}
 
 	// Optimized batch block setting
@@ -2378,6 +2551,7 @@ export class SchematicObject extends EventEmitter {
 
 		// Wait for all chunks to rebuild
 		await Promise.all(rebuildPromises);
+		await this.refreshBlockEntityOverlay();
 		console.log("Chunks rebuilt in", performance.now() - startTime + "ms");
 	}
 

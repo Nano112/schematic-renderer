@@ -10,6 +10,11 @@ import { ResourcePackOptions } from "./types/resourcePack";
 import { SidebarOptions, DEFAULT_SIDEBAR_OPTIONS } from "./ui/sidebar/types";
 import type { SlicerOverlayOptions } from "./ui/SlicerOverlay";
 import type { SchematicRendererContext } from "./SchematicRendererContext";
+import type {
+	BlockEntityRenderer,
+	CaptureSnapshotOptions,
+	CustomPlayerHeadRendererOptions,
+} from "./block-entities/index";
 
 // Re-export sidebar types for consumers
 export type {
@@ -251,6 +256,21 @@ export interface WebGPURendererOptions {
 	forceWebGPU?: boolean;
 }
 
+export interface BlockEntityRenderingOptions {
+	/** Render NBT-backed blocks after the regular block mesh is ready. */
+	enabled?: boolean;
+	/** Register the bundled head, banner, pot, copper-chest, and shulker renderers. */
+	includeDefaultRenderers?: boolean;
+	/** Extra application-provided renderers appended to the bundled registry. */
+	renderers?: readonly BlockEntityRenderer[];
+	/** Player-head texture resolution. No remote endpoint is contacted by default. */
+	playerHeads?: CustomPlayerHeadRendererOptions;
+	/** Bounds applied while capturing the shared palette/block/NBT snapshot. */
+	snapshotOptions?: CaptureSnapshotOptions;
+	/** Receives isolated renderer failures without failing the schematic build. */
+	onError?: (rendererId: string, error: unknown) => void;
+}
+
 export interface SchematicRendererOptions {
 	backgroundColor?: number | string; // Accepts hex color or CSS color string
 	hdri?: string;
@@ -325,6 +345,8 @@ export interface SchematicRendererOptions {
 	definitionRegionOptions?: DefinitionRegionOptions;
 	// Resource pack management options
 	resourcePackOptions?: ResourcePackOptions;
+	// NBT-aware block entity rendering
+	blockEntityOptions?: BlockEntityRenderingOptions;
 	/**
 	 * Unified sidebar UI configuration.
 	 * Consolidates all UI panels (Controls, Render Settings, Capture, Export,
@@ -450,6 +472,10 @@ export const DEFAULT_OPTIONS: SchematicRendererOptions = {
 		autoRebuild: true, // Auto-rebuild atlas when packs change
 		maxPacks: 0, // 0 = unlimited
 		showMissingPackNotice: true, // In-viewport notice when no pack is loaded
+	},
+	blockEntityOptions: {
+		enabled: true,
+		includeDefaultRenderers: true,
 	},
 	sidebarOptions: DEFAULT_SIDEBAR_OPTIONS,
 	resourcePackBlobs: [],

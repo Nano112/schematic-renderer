@@ -297,7 +297,7 @@ export class AssetLoader {
 		}
 
 		// Special handling for liquid models with level information
-		if (modelPath.startsWith("block/water") || modelPath.startsWith("block/lava")) {
+		if (/^block\/(?:water|lava)(?:_level_\d+)?$/.test(modelPath)) {
 			const isWater = modelPath.startsWith("block/water");
 
 			// Extract level from model path if present
@@ -463,6 +463,11 @@ export class AssetLoader {
 
 		// If not a reference, return as is (but handle namespace)
 		if (!textureRef.startsWith("#")) {
+			// Some vanilla models refer to a texture key without the conventional '#'.
+			// Resolve it as a symbolic reference when that key exists in the model.
+			if (model.textures?.[textureRef]) {
+				return this.resolveTexture(`#${textureRef}`, model);
+			}
 			// Remove minecraft: prefix if present
 			return textureRef.replace("minecraft:", "");
 		}
@@ -624,11 +629,12 @@ export class AssetLoader {
 		if (this.colormapsLoaded) return;
 		this.colormapsLoaded = true;
 
-		const [grass, foliage] = await Promise.all([
+		const [grass, foliage, dryFoliage] = await Promise.all([
 			this.loadColormapImageData("colormap/grass"),
 			this.loadColormapImageData("colormap/foliage"),
+			this.loadColormapImageData("colormap/dry_foliage"),
 		]);
-		this.tintManager.setColormaps(grass, foliage);
+		this.tintManager.setColormaps(grass, foliage, dryFoliage);
 	}
 
 	private async loadColormapImageData(texturePath: string): Promise<ImageData | null> {

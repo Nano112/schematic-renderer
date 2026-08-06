@@ -173,6 +173,10 @@ export class RenderManager {
 		return getClampedPixelRatio(this.schematicRenderer.options.maxPixelRatio);
 	}
 	private resizeTimeout: number | null = null;
+	private resizeHandler: (() => void) | null = null;
+	private resizeObserver: ResizeObserver | null = null;
+	private cameraChangedHandler: ((event: { newCamera: string }) => void) | null = null;
+	private renderFrameRequest: number | null = null;
 	// Render-and-blit mode: when the context supplies a shared WebGL renderer, this
 	// view renders into it and blits the result onto its own 2D canvas.
 	private usesSharedRenderer = false;
@@ -244,12 +248,15 @@ export class RenderManager {
 	 * Async initialization - must be called after constructor
 	 */
 	public async initialize(): Promise<void> {
+		if (this.disposed) return;
+
 		const webgpuOptions = this.schematicRenderer.options.webgpuOptions;
 		const preferWebGPU = webgpuOptions?.preferWebGPU ?? false;
 		const forceWebGPU = webgpuOptions?.forceWebGPU ?? false;
 
 		if (preferWebGPU || forceWebGPU) {
 			const webgpuAvailable = await this.checkWebGPUSupport();
+			if (this.disposed) return;
 
 			if (webgpuAvailable || forceWebGPU) {
 				try {
@@ -272,6 +279,13 @@ export class RenderManager {
 			}
 		} else {
 			await this.initWebGLRenderer();
+		}
+
+		// Initialization can outlive the owning SchematicRenderer. Dispose resources
+		// created after teardown instead of attaching listeners to a dead instance.
+		if (this.disposed) {
+			this.dispose();
+			return;
 		}
 
 		this.setupEventListeners();
@@ -300,9 +314,8 @@ export class RenderManager {
 		}
 
 		// Listen for camera changes to handle HDRI switching
-		this.schematicRenderer.cameraManager.on("cameraChanged", (event) => {
-			this.handleCameraChange(event.newCamera);
-		});
+		this.cameraChangedHandler = (event) => this.handleCameraChange(event.newCamera);
+		this.schematicRenderer.cameraManager.on("cameraChanged", this.cameraChangedHandler);
 	}
 
 	/**
@@ -837,18 +850,32 @@ export class RenderManager {
 	}
 
 	private setupEventListeners(): void {
-		window.addEventListener("resize", () => {
+		if (this.resizeHandler || this.disposed) return;
+
+		this.resizeHandler = () => {
+			if (this.disposed) return;
 			if (this.resizeTimeout) {
 				window.cancelAnimationFrame(this.resizeTimeout);
 			}
 			this.resizeTimeout = window.requestAnimationFrame(() => {
-				this.updateCanvasSize();
 				this.resizeTimeout = null;
+				if (!this.disposed) this.updateCanvasSize();
 			});
-		});
+		};
+
+		window.addEventListener("resize", this.resizeHandler);
+
+		// Element resize catches layout changes that do not emit window.resize
+		// (sidebar toggles, modal resizing, responsive grid changes, etc.).
+		const parent = this.schematicRenderer.canvas.parentElement;
+		if (parent && typeof ResizeObserver !== "undefined") {
+			this.resizeObserver = new ResizeObserver(this.resizeHandler);
+			this.resizeObserver.observe(parent);
+		}
 	}
 
 	public updateCanvasSize(): void {
+		if (this.disposed || !this.renderer) return;
 		const canvas = this.schematicRenderer.canvas;
 		const parent = canvas.parentElement;
 		if (!parent) return;
@@ -1368,7 +1395,8 @@ export class RenderManager {
 	public requestRender(): void {
 		if (!this.renderRequested && !this.contextLost && !this.disposed) {
 			this.renderRequested = true;
-			requestAnimationFrame(() => {
+			this.renderFrameRequest = requestAnimationFrame(() => {
+				this.renderFrameRequest = null;
 				if (!this.contextLost && !this.disposed) {
 					this.render();
 				}
@@ -1431,26 +1459,62 @@ export class RenderManager {
 			this.resizeTimeout = null;
 		}
 
-		window.removeEventListener("resize", this.updateCanvasSize);
-		const canvas = this.renderer.domElement;
-		canvas.removeEventListener("webglcontextlost", this.handleContextLost);
-		canvas.removeEventListener("webglcontextrestored", this.handleContextRestored);
+		if (this.renderFrameRequest !== null) {
+			cancelAnimationFrame(this.renderFrameRequest);
+			this.renderFrameRequest = null;
+			this.renderRequested = false;
+		}
+
+		if (this.resizeHandler) {
+			window.removeEventListener("resize", this.resizeHandler);
+			this.resizeHandler = null;
+		}
+		this.resizeObserver?.disconnect();
+		this.resizeObserver = null;
+
+		if (this.cameraChangedHandler) {
+			this.schematicRenderer.cameraManager.off("cameraChanged", this.cameraChangedHandler);
+			this.cameraChangedHandler = null;
+		}
+
+		const renderer = this.renderer;
+		const canvas = renderer?.domElement;
+		canvas?.removeEventListener("webglcontextlost", this.handleContextLost);
+		canvas?.removeEventListener("webglcontextrestored", this.handleContextRestored);
 
 		this.passes.forEach((pass) => {
 			if (pass.dispose) pass.dispose();
 		});
 		this.passes.clear();
 
-		if (this.composer) {
-			this.composer.dispose();
-		}
+		const composers = new Set(
+			[this.composer, this._opaqueComposer, this._alphaComposer].filter(Boolean)
+		);
+		composers.forEach((composer) => composer.dispose?.());
+		this.composer = null;
+		this._opaqueComposer = null;
+		this._alphaComposer = null;
 
 		if (this.pmremGenerator && !this.isPMREMGeneratorDisposed()) {
 			this.pmremGenerator.dispose();
 		}
+		this.pmremGenerator = undefined as unknown as THREE.PMREMGenerator;
 
-		if (this.currentEnvMap) {
-			this.currentEnvMap.dispose();
+		const textures = new Set<THREE.Texture>();
+		if (this.currentEnvMap) textures.add(this.currentEnvMap);
+		if (this.originalBackground instanceof THREE.Texture) textures.add(this.originalBackground);
+		if (this._imageBackground) textures.add(this._imageBackground);
+		textures.forEach((texture) => texture.dispose());
+		this.currentEnvMap = null;
+		this.originalBackground = null;
+		this._imageBackground = null;
+
+		const scene = this.schematicRenderer.sceneManager?.scene;
+		if (scene?.background instanceof THREE.Texture && textures.has(scene.background)) {
+			scene.background = null;
+		}
+		if (scene?.environment && textures.has(scene.environment)) {
+			scene.environment = null;
 		}
 
 		if (this.inspector) {
@@ -1460,9 +1524,11 @@ export class RenderManager {
 
 		// Don't dispose a shared renderer — it's owned by the context and used by
 		// sibling views. The context disposes it.
-		if (!this.usesSharedRenderer) {
-			this.renderer.dispose();
+		if (!this.usesSharedRenderer && renderer) {
+			renderer.dispose();
 		}
+		this.renderer = undefined as unknown as AnyRenderer;
+		this.blitCtx = null;
 	}
 
 	// ===== ALPHA MODE API =====
@@ -1473,7 +1539,7 @@ export class RenderManager {
 	 * the alpha channel through the post-processing pipeline (gamma, SMAA, etc.).
 	 */
 	public async setAlphaMode(enabled: boolean): Promise<void> {
-		if (this._alphaMode === enabled) return;
+		if (this.disposed || this._alphaMode === enabled) return;
 		this._alphaMode = enabled;
 
 		if (enabled) {
@@ -1484,6 +1550,7 @@ export class RenderManager {
 
 			// Build fresh alpha composer
 			await loadPostProcessing();
+			if (this.disposed) return;
 			const glRenderer = this.renderer as THREE.WebGLRenderer;
 			const cam = this.schematicRenderer.cameraManager.activeCamera.camera;
 			const scene = this.schematicRenderer.sceneManager.scene;
